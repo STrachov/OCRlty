@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "OCRlty"
+version = "0.1.0"
+description = "Core logic (OCR + Arctic-TILT pipelines)"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lib", "lib.*"]
+
+[tool.setuptools]
+package-dir = { "" = "." }

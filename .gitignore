@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env*
+.ipynb_checkpoints/
+.notebooks_cache/
+# артефакты/данные — вне гита
+/data/
+/models/
+/outputs/
+/wheelhouse*/
+/workspace/
+/.runpod/
+/.cache/

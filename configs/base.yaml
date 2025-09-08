@@ -1,0 +1,9 @@
+paths:
+  models: "models"
+  data:   "data"
+  cache:  ".cache"
+ocr:
+  lang: "en"
+limits:
+  max_pages: 3
+use_gpu: true
