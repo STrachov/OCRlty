@@ -1,0 +1,7 @@
+tilt:
+  base_url: ${VLLM_BASE_URL}
+  model: Snowflake/snowflake-arctic-tilt-v1.3
+  timeout_s: 10.0
+
+normalizer:
+  enabled: false

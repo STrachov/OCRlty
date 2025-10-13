@@ -1,0 +1,87 @@
+# ---- VCS ----
+.git
+.git/*
+!.gitignore
+
+# ---- Python bytecode & build ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+build/
+dist/
+pip-wheel-metadata/
+.mypy_cache/
+.pytype/
+.pytest_cache/
+.coverage*
+htmlcov/
+
+# ---- Virtual envs & IDEs ----
+.venv*/
+venv*/
+env*/
+ENV*/
+.vscode/
+.idea/
+*.iml
+*.code-workspace
+
+# ---- Node/Frontend (if present in monorepo) ----
+node_modules/
+npm-debug.log*
+.pnpm-store/
+.next/
+out/
+
+# ---- Notebooks ----
+**/.ipynb_checkpoints/
+
+# ---- OS cruft ----
+.DS_Store
+Thumbs.db
+
+# ---- Data & artifacts (keep repo light) ----
+data/
+datasets/
+experiments/
+logs/
+tmp/
+temp/
+outputs/
+storage/
+checkpoints/
+runs/
+media/
+assets/
+samples/
+testdata/
+
+# ---- Model/caches ----
+.cache/
+.huggingface/
+**/huggingface/
+transformers_cache/
+hf_cache/
+models/
+weights/
+
+# ---- Docker noise ----
+docker-compose.override.yml
+
+# ---- Allowlist: code and configs needed for build from repo root ----
+!apps/
+!apps/api_gpu/
+!apps/api_gpu/**
+!scripts/
+!scripts/**
+!configs/
+!configs/**
+!pyproject.toml
+!poetry.lock
+!requirements*.txt
+!Dockerfile
+!Dockerfile.dev

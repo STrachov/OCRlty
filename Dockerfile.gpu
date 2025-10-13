@@ -1,0 +1,18 @@
+FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+
+WORKDIR /workspace
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements-gpu.txt ./
+RUN pip install --upgrade pip && pip install -r requirements-gpu.txt
+
+COPY . .
+RUN pip install -e .
+
+COPY scripts/start_all.sh scripts/start_all.sh
+RUN chmod +x scripts/start_all.sh
+EXPOSE 8000 8001
+ENTRYPOINT ["bash","scripts/start_all.sh"]

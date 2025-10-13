@@ -1,0 +1,59 @@
+Контекст проекта.
+
+Цель: R&D с последующей разработкой OCR сервиса для счетов и инвойсов (ориентация на текущую потребность у клиентов Upwork).
+Архитектура кода: monorepo; apps/api-gpu/ - для работы с моделью и запускается на gpu (например на runpod), apps/api-cpu/ - для работы с клиентом (запускается на cpu хостинге), R&D-ноуты в notebooks/gpu/, общие функции в пакете lib/,.
+Импорты: pyproject.toml (setuptools), pip install -e . → импорт lib.* отовсюду. 
+Зависимости: requirements-gpu.txt (PyTorch 2.4 / CUDA 12.4, vLLM 0.8.x, PaddleOCR 3.x, FastAPI и утилиты). Использование сохраненных wheels для быстрой повторной установки (особенно на дорогих gpu подах)
+RunPod: Spot + Network Volume; venv: /workspace/venv-gpu; кэши HF/Paddle в /workspace/.cache; опц. wheelhouse /workspace/wheelhouse-gpu.
+Монты: Pod → /workspace, (на будущее) Serverless → /runpod-volume.
+Регион: с наибольшей на данный момент доступностью A5000 (medium-high availability), без S3-доступа к NV — ок, работаем через запущенный Pod.
+Практика работы: “спринты” + Terminate между ними; минимизируем бюджет на сессию (желательно до ~$1–2).
+
+Ориентировочный план верхнего уровня (этапы):
+1) Каркас репо (lib/apps/scripts/configs/notebooks, pyproject.toml, заглушка пайплайна).
+2) OCR на CPU (минимум, без TILT).
+3) GPU-среда на RunPod (Pod+NV, единый venv-gpu, веса скачаны).
+Чтобы обеспечить быстрый старт/минимальную стоимость (критерий - минимальное время от старта до “готов к работе”, желательно < 5 минут):
+	- Terminate между спринтами,
+	- автостоп (таймер),
+	- кэши HF/Paddle/PIP на NV,
+	- venv на NV + базовый bootstrap,
+	- минимальный wheelhouse только для самых тяжёлых пакетов под текущий шаблон.
+	 
+4) Подключение Arctic-TILT (минимум, 2–3 поля).
+5) Контур оценки (простые метрики/эталоны).
+6) Пост-обработка/нормализация (рост метрик).
+7) Dev-API (для себя) на GPU. Полный wheelhouse на NV,
+8) Мини-демо + Backlog следующих итераций.
+
+Рабочий процесс разработки:
+Кратко: Local (Cursor/Win10) ↔ GitHub ↔ Runpod 
+Подробно:
+Local (Cursor/Windows 10): 
+	- Пишем код в lib/…, минимальные CPU-тесты и форматирование.
+	- py -3.11 -m venv .venv → pip install -e . → pip install -r requirements-gpu.txt (без GPU-части по желанию).
+	- Коммитим только код/конфиги, не данные/веса/venv.
+GitHub:
+	- центр синхронизации кода.
+	- (Опционально позже) CI на линт/pytest; сборка Docker образа — когда дойдём до прод.
+RunPod (GPU + NV):
+	- Только то, что требует GPU: vLLM/TILT, бенчи, профилинг.
+	- Тянем только последний коммит из одной ветки.
+		git clone --depth 1 --single-branch --branch main https://github.com/<USER>/<REPO>.git
+	- Единый venv-gpu и кэши на NV, «спринты» с Terminate в конце.
+
+Текущая структура проекта:
+your-project/
+├─ apps/
+│  └─ api-gpu/
+├─ configs/
+├─ lib/
+│  └─ pipelines/
+├─ notebooks/
+│  └─ gpu/
+├─ scripts/
+├─ pyproject.toml
+├─ requirements-gpu.txt
+├─ .gitignore
+└─ README.md
+   

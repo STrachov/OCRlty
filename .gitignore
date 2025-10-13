@@ -11,3 +11,7 @@ __pycache__/
 /workspace/
 /.runpod/
 /.cache/
+/venv/
+/.ssh/
+/notebooks/gpu/samples/**/src/
+

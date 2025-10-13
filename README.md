@@ -177,6 +177,38 @@ git branch -M main
 git remote add origin https://github.com/STrachov/OCRlty.git
 git push -u origin main
 
-Сюда же позже добавишь реальный OCR (в lib/ocr/…) и Arctic-TILT (в lib/tilt/…), не трогая структуру.
+## Вариант с wheelhouse
+export RUNPOD_VOLUME_ROOT=/workspace
+python -m venv ${RUNPOD_VOLUME_ROOT}/venv-gpu
+source ${RUNPOD_VOLUME_ROOT}/venv-gpu/bin/activate
+export PIP_CACHE_DIR=/workspace/.cache/pip
+mkdir -p ${RUNPOD_VOLUME_ROOT}/wheelhouse-gpu
 
-Если не хочешь ставить torch в venv (а использовать системный из шаблона) — просто удаляй блок torch/vision/audio из requirements-gpu.txt перед установкой.
+# если wheelhouse ещё пустой — собрать
+if [ ! "$(ls -A ${RUNPOD_VOLUME_ROOT}/wheelhouse-gpu 2>/dev/null)" ]; then
+  pip install -U pip
+  pip download -r requirements-gpu.txt -d ${RUNPOD_VOLUME_ROOT}/wheelhouse-gpu
+fi
+
+# установка офлайн из wheelhouse
+pip install --no-index --find-links=${RUNPOD_VOLUME_ROOT}/wheelhouse-gpu -r requirements-gpu.txt
+
+# Для Windows
+# 1) Переменная окружения (на текущую сессию)
+$env:RUNPOD_VOLUME_ROOT = "D:\master\ocrlty"   # укажи свой путь
+# (опционально) создать папку, если нет
+New-Item -ItemType Directory -Force -Path $env:RUNPOD_VOLUME_ROOT | Out-Null
+# 2) Создать venv на нужной версии Python
+py -3.11 -m venv "$env:RUNPOD_VOLUME_ROOT\venv-gpu"
+# 3) Активировать venv
+& "$env:RUNPOD_VOLUME_ROOT\venv-gpu\Scripts\Activate.ps1"
+# Проверка
+python --version
+
+
+
+
+# подключить твой пакет (lib/) и прогреть веса
+pip install -e .
+python scripts/warmup.py
+python scripts/infer.py --input ${RUNPOD_VOLUME_ROOT}/data/samples

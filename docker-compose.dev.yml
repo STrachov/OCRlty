@@ -1,0 +1,28 @@
+services:
+  mock-vllm:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: uvicorn scripts.mock_vllm:app --host 0.0.0.0 --port 8001
+    ports:
+      - "8001:8001"
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    depends_on:
+      - mock-vllm
+    environment:
+      - VLLM_BASE_URL=http://mock-vllm:8001/v1
+      - MOCK_VLLM=1
+      - PYTHONUNBUFFERED=1
+      #- PYTHONPATH=/app
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
