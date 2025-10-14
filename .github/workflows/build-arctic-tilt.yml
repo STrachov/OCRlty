@@ -7,12 +7,6 @@ permissions:
   contents: read
   packages: write
 
-env:
-  REGISTRY: ghcr.io
-  OWNER_LC: ${{ toLower(github.repository_owner) }}   # <— всё строчными
-  IMAGE_NAME: arctic-tilt                             # <— любое имя, сразу в нижнем регистре
-  TAG: cu121-py310-v0.8.3
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -23,7 +17,7 @@ jobs:
 
       - uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -33,6 +27,7 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
+          # ← ВПИШИ СВОЙ НИК В НИЖНЕМ РЕГИСТРЕ
+          tags: ghcr.io/strachov/arctic-tilt:cu121-py310-v0.8.3
           cache-from: type=gha
           cache-to: type=gha,mode=max
