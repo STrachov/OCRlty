@@ -19,9 +19,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # чтобы компоновщик видел cudart из toolkita
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 
-# Python 3.10 + инструменты (без cmake из apt!)
+# Python 3.10 + инструменты (важно: добавили python3.10-dev и kmod)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3.10 python3.10-venv python3-pip \
+      python3.10 python3.10-venv python3.10-dev python3-pip \
       git ca-certificates curl build-essential ninja-build pkg-config kmod \
     && rm -rf /var/lib/apt/lists/*
 
@@ -36,12 +36,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
       --extra-index-url https://download.pytorch.org/whl/cu124 \
       torch==2.6.0
 
-# Клонируем Arctic-TILT (v0.8.3) и собираем wheel их форка vLLM
+# Клонируем Arctic-TILT (v0.8.3)
 WORKDIR /opt
 RUN git clone --depth=1 --branch v0.8.3 https://github.com/Snowflake-Labs/arctic-tilt.git arctic-tilt \
  && cd arctic-tilt && (git fetch --unshallow || true) && cd ..
 
-# Собираем колёса в /wheels (главное — vllm-*.whl), без изоляции/доп. deps
+# Собираем wheel их форка vLLM (главное — vllm-*.whl), без изоляции/доп. deps
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3.10 -m pip wheel --no-deps --no-build-isolation -w /wheels /opt/arctic-tilt
 
