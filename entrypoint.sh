@@ -7,10 +7,10 @@ set -euo pipefail
 : "${TP_SIZE:=1}"
 : "${VLLM_GPU_UTIL:=0.80}"
 
-# большой shared memory (если смонтирован маленький)
+# на всякий случай — большой shm
 mount -o remount,size=${SHM_SIZE:-4g} /dev/shm 2>/dev/null || true
 
-# опц. режим «не запускать сервер», чтобы получить шелл
+# режим отладки: только открыть терминал
 if [[ "${SLEEP_ON_START:-0}" == "1" ]]; then
   echo "[entrypoint] SLEEP_ON_START=1 -> tail -f /dev/null"
   exec tail -f /dev/null
@@ -18,7 +18,6 @@ fi
 
 echo "[entrypoint] MODEL_ID=$MODEL_ID HOST=$HOST PORT=$PORT TP=$TP_SIZE"
 
-# единичный GPU — Ray не нужен, стартуем проще
 python -m vllm.entrypoints.openai.api_server \
   --model "$MODEL_ID" \
   --host "$HOST" \
@@ -26,4 +25,4 @@ python -m vllm.entrypoints.openai.api_server \
   --tensor-parallel-size "$TP_SIZE" \
   --gpu-memory-utilization "$VLLM_GPU_UTIL" \
   --trust-remote-code \
-  --engine-use-ray=False
+  --log-level "${VLLM_LOGGING_LEVEL:-INFO}"
