@@ -9,11 +9,12 @@ RUN pip install --no-cache-dir typing_extensions==4.12.2 && \
     pip install --no-cache-dir einops sentencepiece "httpx>=0.27"
 
 # Тянем готовый wheel
+ARG VLLM_WHL_NAME=vllm-0.8.3-cp310-cp310-linux_x86_64.whl
 ARG VLLM_WHL_URL
 ARG VLLM_WHL_SHA256
-ADD ${VLLM_WHL_URL} /wheels/vllm.whl
-RUN echo "${VLLM_WHL_SHA256}  /wheels/vllm.whl" | sha256sum -c - && \
-    pip install --no-cache-dir /wheels/vllm.whl
+ADD ${VLLM_WHL_URL} /wheels/${VLLM_WHL_NAME}
+RUN echo "${VLLM_WHL_SHA256}  /wheels/${VLLM_WHL_NAME}" | sha256sum -c - && \
+    pip install --no-cache-dir "/wheels/${VLLM_WHL_NAME}"
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
