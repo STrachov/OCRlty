@@ -6,7 +6,7 @@ on:
     branches: [ main ]
 
 env:
-  IMAGE: ghcr.io/Strachov/arctic-tilt:cu124-py310-torch26-v0.8.3
+  IMAGE: ghcr.io/strachov/arctic-tilt:cu124-py310-torch26-v0.8.3
   VLLM_WHL_URL: https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/vllm-0.8.3-cp310-cp310-linux_x86_64.whl
   VLLM_WHL_SHA256: c0f53b29a7c2b79a86d45fed8770b4164b46dfe5cda5bc4cd375bb86f3335811
 
