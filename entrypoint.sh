@@ -1,40 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${MODEL_ID:=Snowflake/snowflake-arctic-tilt-v1.3}"
-: "${HOST:=0.0.0.0}"
-: "${PORT:=8001}"
-: "${TP_SIZE:=1}"
-: "${VLLM_GPU_UTIL:=0.80}"
-: "${SHM_MIN_MB:=2048}"   # ремоунт /dev/shm, только если меньше 2 ГБ
+: "${GIT_URL:=https://github.com/STrachov/OCRlty.git}"
+: "${GIT_BRANCH:=main}"
+: "${HF_HOME:=/workspace/cache/hf}"
+: "${PORT_VLLM:=8001}"
+: "${PIP_FIND_LINKS:=/workspace/wheelhouse}"
+: "${PIP_NO_INDEX:=1}"
 
-# Не уменьшаем большой shm: ремоунтим только если маленький
-cur_kb=$(df -k /dev/shm | awk 'NR==2{print $2}')
-if [ "${cur_kb:-0}" -lt $((SHM_MIN_MB*1024)) ]; then
-  mount -o remount,size=${SHM_SIZE:-4g} /dev/shm 2>/dev/null || true
+mkdir -p /workspace/src /workspace/wheelhouse "$HF_HOME"
+
+#код (clone/pull)
+if [ ! -d /workspace/src/.git ]; then
+  git clone --branch "$GIT_BRANCH" --depth 1 "$GIT_URL" /workspace/src
+else
+  git -C /workspace/src fetch origin "$GIT_BRANCH" --depth 1
+  git -C /workspace/src checkout "$GIT_BRANCH"
+  git -C /workspace/src reset --hard "origin/$GIT_BRANCH"
 fi
 
-# Режим отладки: позволить зайти в веб-терминал без запуска сервера
-if [[ "${SLEEP_ON_START:-0}" == "1" ]]; then
-  echo "[entrypoint] SLEEP_ON_START=1 -> tail -f /dev/null"
-  exec tail -f /dev/null
+#окружение (персистентный venv + системные site-packages)
+if [ ! -d /workspace/venv ]; then
+  python3.10 -m venv /workspace/venv --system-site-packages
+  . /workspace/venv/bin/activate
+  export PIP_NO_INDEX PIP_FIND_LINKS
+  # лёгкие зависимости приложения
+  if [ -f /workspace/src/requirements-gpu.txt ]; then
+    pip install -U pip && pip install -r /workspace/src/requirements-gpu.txt
+  fi
+else
+  . /workspace/venv/bin/activate
 fi
 
-echo "[entrypoint] MODEL_ID=$MODEL_ID HOST=$HOST PORT=$PORT TP=$TP_SIZE"
-
-# Короткая сводка окружения
-python - <<'PY'
-import torch, vllm, os
-print("torch", torch.__version__, "cuda", torch.version.cuda, "cuda_available", torch.cuda.is_available())
-print("vllm version", getattr(vllm, "__version__", "unknown"))
-print("HF token set:", bool(os.getenv("HUGGING_FACE_HUB_TOKEN")))
-PY
-
-# Старт API (без неподдерживаемых флагов)
-exec python -m vllm.entrypoints.openai.api_server \
-  --model "$MODEL_ID" \
-  --host "$HOST" \
-  --port "$PORT" \
-  --tensor-parallel-size "$TP_SIZE" \
-  --gpu-memory-utilization "$VLLM_GPU_UTIL" \
-  --trust-remote-code
+#запуск TILT-сервера (пример: apps/tilt_api.py)
+cd /workspace/src
+python -m uvicorn apps.tilt_api:app --host 0.0.0.0 --port "$PORT_VLLM"

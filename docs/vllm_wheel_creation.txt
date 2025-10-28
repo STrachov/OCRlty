@@ -1,0 +1,152 @@
+0) Подключение
+Используем PuTTY. Чтобы не прерывалось:
+В PuTTY (клиент):
+  Connection → Seconds between keepalives: 15–30
+  Connection → Enable TCP keepalives: включить.
+  Connection → SSH → Kex:
+  Max minutes before rekey → 0 (выключить) или 360 (6 часов).
+  Max data before rekey → 0.
+  Сохранить эти настройки в сессию.
+На сервере (опционально) 
+  Включим серверные keepalive:
+    sudo bash -c 'printf "\nClientAliveInterval 60\nClientAliveCountMax 3\n" >> /etc/ssh/sshd_config'
+    sudo systemctl reload ssh
+
+1) Установить и запустить tmux
+apt-get update && apt-get install -y tmux
+tmux
+2) Создать своп-файл на 32ГБ (можно 64 - если жесткий диск позволяет)
+sudo fallocate -l 32G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# опционально сделаем своп чуть «активнее»
+echo 'vm.swappiness=20' | sudo tee /etc/sysctl.d/99-swap.conf
+sudo sysctl --system
+
+# посмотрим сколько всего памяти
+free -h
+
+3) Установить и запустить docker
+apt-get update
+apt-get install -y ca-certificates curl gnupg
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo \
+"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+ https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+> /etc/apt/sources.list.d/docker.list
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+docker --version
+
+4) Собрать колесо vLLM (TILT) в контейнере-builder
+mkdir -p /root/tilt_build/wheelhouse
+docker rm -f tilt-builder 2>/dev/null || true
+
+docker run -d --name tilt-builder \
+  -v /root/tilt_build/wheelhouse:/wheelhouse \
+  nvidia/cuda:12.4.1-devel-ubuntu22.04 \
+  bash -lc '
+set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update && apt-get install -y --no-install-recommends \
+  python3.10 python3.10-venv python3.10-dev python3-pip \
+  git build-essential ninja-build pkg-config kmod curl ca-certificates && \
+rm -rf /var/lib/apt/lists/*
+
+python3.10 -m pip install -U pip wheel setuptools setuptools-scm jinja2 packaging
+python3.10 -m pip install "cmake>=3.29" "numpy<2.3"
+python3.10 -m pip install --no-cache-dir typing_extensions==4.12.2
+python3.10 -m pip install --no-cache-dir \
+  --extra-index-url https://download.pytorch.org/whl/cu124 \
+  torch==2.6.0
+
+git clone --depth=1 --branch v0.8.3 https://github.com/Snowflake-Labs/arctic-tilt.git /opt/arctic-tilt
+cd /opt/arctic-tilt && (git fetch --unshallow || true)
+
+# мягкий параллелизм, Release, один SM
+export CMAKE_BUILD_PARALLEL_LEVEL=4 MAX_JOBS=4 NINJA_FLAGS=-j4
+export NVCC_THREADS=1 TORCH_CUDA_ARCH_LIST="8.6" CUDA_HOME=/usr/local/cuda
+export SETUPTOOLS_SCM_PRETEND_VERSION=0.8.3
+export CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release"
+
+python3.10 -m pip wheel --no-deps --no-build-isolation -w /wheelhouse /opt/arctic-tilt
+'
+
+# следить за логом можно в tmux:
+docker logs -f tilt-builder
+
+# если были сбои - посмотреть где
+journalctl -u ssh -n 200 --no-pager
+grep -iE 'disconnect|timeout|oom|killed' /var/log/auth.log /var/log/syslog 2>/dev/null | tail -n 100
+dmesg -T | tail -n 50
+uptime -s && who -a
+
+
+5) Если сессия прервется
+tmux attach -t build
+
+6) На локальном ПК скопировать файл 
+scp root@IP:/root/tilt_build/wheelhouse/vllm-*.whl .
+
+7) выложить wheel в GitHub Releases 
+репозиторий → Releases → Draft a new release → указать Tag, например: tilt-vllm-cu124-py310-torch26 → Attach binaries → Publish release → скопировать прямой URL на asset (кнопка “Copy link”) → сохранить хеш в нижнем регистре
+
+https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/vllm-0.8.3-cp310-cp310-linux_x86_64.whl
+
+sha256:c0f53b29a7c2b79a86d45fed8770b4164b46dfe5cda5bc4cd375bb86f3335811
+
+8) В Dockerfile укажи URL и SHA как build-args и закоммитить в GitHub - actions отработает по указанному workflow и получим build 
+
+9) запуск на Runpod
+Image: ghcr.io/strachov/arctic-tilt:cu124-py310-torch26-v0.8.3
+Port: 8888,8000,8001
+Env:
+HUGGING_FACE_HUB_TOKEN=<>
+HF_HOME=/workspace/cache/hf
+VLLM_LOGGING_LEVEL=DEBUG
+VLLM_GPU_UTIL=0.80 #(по желанию)
+
+Command: /bin/bash -lc "sleep infinity" 
+
+Проверка: curl http://<ip>:8001/v1/models.
+docker pull ghcr.io/strachov/arctic-tilt:cu124-py310-torch26-v0.8.3
+
+
+
+
+
+
+
+
+
+
+  Created wheel for vllm: filename=vllm-0.8.3-cp310-cp310-linux_x86_64.whl size=428125632 sha256=c0f53b29a7c2b79a86d45fed8770b4164b46dfe5cda5bc4cd375bb86f3335811
+  Stored in directory: /root/.cache/pip/wheels/18/34/03/cc2be10ac7f8a71a4d2052c6eaa48432574cbf56697ebd1613
+Successfully built vllm
+root@brief-chipmunk:~# ls -lh /root/tilt_build/wheelhouse
+total 409M
+-rw-r--r-- 1 root root 409M Oct 16 11:34 vllm-0.8.3-cp310-cp310-linux_x86_64.whl
+root@brief-chipmunk:~#
+root@brief-chipmunk:~# sha256sum /root/tilt_build/wheelhouse/vllm-*.whl
+c0f53b29a7c2b79a86d45fed8770b4164b46dfe5cda5bc4cd375bb86f3335811  /root/tilt_build/wheelhouse/vllm-0.8.3-cp310-cp310-linux_x86_64.whl
+
+
+
+root@brief-chipmunk:~# scp root@185.8.107.180:/root/tilt_build/wheelhouse/vllm-*.whl .
+ssh: Could not resolve hostname ip: Temporary failure in name resolution
+scp: Connection closed
+
+PS C:\Users\SciTensor\Downloads> Get-FileHash ~\Downloads\vllm-*.whl -Algorithm SHA256
+
+Algorithm       Hash                                                                   Path
+---------       ----                                                                   ----
+SHA256          C0F53B29A7C2B79A86D45FED8770B4164B46DFE5CDA5BC4CD375BB86F3335811       C:\Users\SciTensor\Downlo...
+
+
+              
