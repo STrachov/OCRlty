@@ -32,8 +32,8 @@
 ---
 
 ## 3) Колесо vLLM 0.8.3 (форк Arctic‑TILT) — сборка и выкладка
-- Сборка делалась на выделенной машине (64 ГБ RAM, быстрый NVMe). Итоговый wheel ≈ **400–420 МБ**. Процесс сборки подробно описан в файле vllm_wheel_creation.txt
-- Колесо кладём в **GitHub Releases** своего репозитория (например, тег `tilt-vllm-cu124-py310-torch26`).
+- Сборка делалась на выделенной сервере (16 ядер, 64 ГБ RAM, быстрый NVMe). Итоговый wheel ≈ **400–420 МБ**. Процесс сборки подробно описан в файле vllm_wheel_creation.txt
+- Колесо кладём в **GitHub Releases** своего репозитория (тег `tilt-vllm-cu124-py310-torch26`).
 
   
 ---
@@ -56,7 +56,7 @@
 
   **Env:**
   ```
-  #опционально (все основные используемые далее и их значения по умолчанию)
+  #опционально (все основные переменные окружения и их значения, используемые в коде)
   #VLLM_WHL_URL=https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/vllm-0.8.3-cp310-cp310-linux_x86_64.whl
   #VLLM_WHL_NAME=vllm-0.8.3-cp310-cp310-linux_x86_64.whl
   #VLLM_WHL_SHA256=sha256:c0f53b29a7c2b79a86d45fed8770b4164b46dfe5cda5bc4cd375bb86f3335811
