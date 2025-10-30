@@ -39,9 +39,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags:  |
-            ${{ env.IMAGE }}                               # твой "фиксированный" тег
-            ghcr.io/strachov/arctic-tilt:latest            # всегда последний билд
-            ghcr.io/strachov/arctic-tilt:${{ env.DATE }}-a1 # датированный тег (замени a1 при желании)
+            ${{ env.IMAGE }}
+            ghcr.io/strachov/arctic-tilt:latest            
+            ghcr.io/strachov/arctic-tilt:${{ env.DATE }}-a1 
             
           build-args: |
             VLLM_WHL_URL=${{ env.VLLM_WHL_URL }}
