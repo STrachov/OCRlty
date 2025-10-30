@@ -1,12 +1,11 @@
 # --- PyTorch (CUDA 12.4, Py3.11) ---
 --extra-index-url https://download.pytorch.org/whl/cu124
-torch==2.4.0+cu124
-torchvision==0.19.0+cu124
-torchaudio==2.4.0+cu124
-
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124
 # --- vLLM / Arctic-TILT ---
-vllm==0.8.3
--e git+https://github.com/Snowflake-Labs/arctic-tilt@v0.8.3#egg=arctic-tilt
+#vllm==0.8.3
+#-e git+https://github.com/Snowflake-Labs/arctic-tilt@v0.8.3#egg=arctic-tilt
 
 # --- HF / токенизация ---
 huggingface_hub>=0.23
