@@ -1,43 +1,28 @@
-# --- PyTorch (CUDA 12.4, Py3.11) ---
---extra-index-url https://download.pytorch.org/whl/cu124
-torch==2.6.0+cu124
-torchvision==0.21.0+cu124
-torchaudio==2.6.0+cu124
-# --- vLLM / Arctic-TILT ---
-#vllm==0.8.3
-#-e git+https://github.com/Snowflake-Labs/arctic-tilt@v0.8.3#egg=arctic-tilt
-
-# --- HF / токенизация ---
-huggingface_hub>=0.23
-tokenizers>=0.15,<0.20
+# -------------------- HF / vLLM stack --------------------
+# Жёсткая, совместимая пара, чтобы перекрыть системные и исключить падения
+transformers==4.57.1
+tokenizers==0.23.0
+huggingface_hub>=0.23,<1.0
 sentencepiece>=0.1.99
 tiktoken>=0.6
 
-# --- OCR (GPU; PaddleOCR 3.x) ---
-paddlepaddle-gpu==2.6.1          # Py3.11 совместимая ветка
-paddleocr>=3.1,<4.0              # 3.x как и в CPU-профиле
-# onnxruntime-gpu 1.18 может требовать совместимости по CUDA;
-# если не нужен — лучше НЕ ставить:
-# onnxruntime-gpu==1.18.1
-
-# --- Изображения / геометрия ---
-opencv-python>=4.9,<5.0
-Pillow>=10.2
-shapely>=2.0
-pyclipper>=1.3
-rapidfuzz>=3.0
-
-# --- PDF / входы ---
-pypdfium2>=4.20
-pdfminer.six>=20221105
-
-# --- API / утилиты ---
-fastapi>=0.110
-uvicorn[standard]>=0.27
-httpx>=0.27
+# -------------------- API / runtime --------------------
+fastapi>=0.120,<1.0
+uvicorn[standard]>=0.38
+httpx>=0.28
 python-multipart>=0.0.9
 pydantic>=2.5
 loguru>=0.7
-
-# --- Базовые ---
 numpy>=1.25,<3
+pandas>=2.3,<3
+
+# -------------------- OCR / PDF --------------------
+# Не добавляем opencv-python: paddleocr притянет paddlex, который тянет opencv-contrib
+paddlepaddle-gpu==2.6.1
+paddleocr>=3.3,<4.0
+pypdfium2>=5.0.0
+pdfminer.six==20250506
+shapely>=2.0
+pyclipper>=1.3
+rapidfuzz>=3.14
+python-bidi==0.6.7

@@ -1,42 +1,96 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${GIT_URL:=https://github.com/STrachov/OCRlty.git}"
-: "${GIT_BRANCH:=main}"
+: "${SRC_DIR:=/workspace/src}"
+: "${VENV_DIR:=/workspace/venv}"
+: "${WHEELHOUSE:=/workspace/wheelhouse}"
 : "${HF_HOME:=/workspace/cache/hf}"
-: "${PORT_VLLM:=8001}"
-: "${PIP_FIND_LINKS:=/workspace/wheelhouse}"
-# wheelhouse оставляем как «подсказку», но НЕ режем доступ к PyPI
- 
-mkdir -p /workspace/src /workspace/wheelhouse "$HF_HOME"
+: "${HOST:=0.0.0.0}"
+: "${PORT:=8001}"
 
-# код (clone/pull)
-if [ ! -d /workspace/src/.git ]; then
-  git clone --branch "$GIT_BRANCH" --depth 1 "$GIT_URL" /workspace/src
-else
-  git -C /workspace/src fetch origin "$GIT_BRANCH" --depth 1
-  git -C /workspace/src reset --hard "origin/$GIT_BRANCH"
+export HF_HOME
+
+if [[ ! -d "$SRC_DIR" ]]; then
+  echo "[entrypoint] ERROR: source directory $SRC_DIR is missing (mount your repo)."
+  exit 1
+fi
+REQ_FILE="$SRC_DIR/requirements-gpu.txt"
+if [[ ! -f "$REQ_FILE" ]]; then
+  echo "[entrypoint] ERROR: $REQ_FILE is missing in repo."
+  exit 1
+fi
+APP_FILE="$SRC_DIR/apps/tilt_api.py"
+if [[ ! -f "$APP_FILE" ]]; then
+  echo "[entrypoint] ERROR: $APP_FILE is missing in repo."
+  exit 1
 fi
 
+mkdir -p "$WHEELHOUSE" "$HF_HOME"
 
-# venv
-if [ ! -d /workspace/venv ]; then
-  python3.10 -m venv /workspace/venv --system-site-packages
+# ----------------------------
+# VENV: reuse системных пакетов (Torch/CUDA из образа)
+# ----------------------------
+if [[ ! -d "$VENV_DIR" ]]; then
+  python3.10 -m venv "$VENV_DIR" --system-site-packages
 fi
-. /workspace/venv/bin/activate
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
 
-# <<< ВАЖНО: без PIP_NO_INDEX. Разрешаем PyPI + подмешиваем wheelhouse >>>
-python -m pip install -U pip
-# Подстрахуемся: заранее доставим билд-инструменты, которые часто нужны из PyPI
-python -m pip install --extra-index-url https://pypi.org/simple \
-  "cmake>=3.26" "ninja" "scikit-build-core" "build" "setuptools" || true
+# ----------------------------
+# pip: строго оффлайн по wheelhouse (без сети)
+# (не обновляем pip, чтобы не упасть оффлайн)
+# ----------------------------
+export PIP_NO_INDEX=1
+export PIP_FIND_LINKS="$WHEELHOUSE"
 
-if [ -f /workspace/src/requirements-gpu.txt ]; then
-  python -m pip install --find-links "$PIP_FIND_LINKS" \
-    --extra-index-url https://pypi.org/simple \
-    -r /workspace/src/requirements-gpu.txt
+# vLLM: должен быть в системе ИЛИ колесом в wheelhouse
+if ! python - <<'PY'
+try:
+    import vllm  # noqa
+    import sys; sys.exit(0)
+except Exception:
+    import sys; sys.exit(1)
+PY
+then
+  shopt -s nullglob
+  VLLM_WHEELS=("$WHEELHOUSE"/vllm-*.whl)
+  if (( ${#VLLM_WHEELS[@]} == 0 )); then
+    echo "[entrypoint] ERROR: vLLM not found system-wide AND no wheel in $WHEELHOUSE."
+    echo "Place vllm-*.whl (e.g. 0.8.3 cp310 cu124) into $WHEELHOUSE or bake vLLM into base image."
+    exit 1
+  fi
+  python -m pip install --no-cache-dir "${VLLM_WHEELS[@]}"
 fi
 
-# запуск API
-cd /workspace/src
-python -m uvicorn apps.tilt_api:app --host 0.0.0.0 --port "$PORT_VLLM"
+# Устанавливаем требования строго из wheelhouse
+python -m pip install --no-cache-dir -r "$REQ_FILE"
+
+# Быстрый sanity-check совместимости transformers ↔ tokenizers
+python - <<'PY'
+import sys
+try:
+    import transformers, tokenizers
+    def parse(v):
+        parts = []
+        for p in v.split('.'):
+            if p.isdigit():
+                parts.append(int(p))
+            else:
+                # отбрасываем суффиксы типа rc/post
+                num = ''.join(ch for ch in p if ch.isdigit())
+                parts.append(int(num) if num else 0)
+        return tuple(parts or [0])
+    tv = parse(getattr(transformers, "__version__", "0"))
+    kv = parse(getattr(tokenizers, "__version__", "0"))
+    # Для transformers >= 4.57.0 — требуем 0.22.0 <= tokenizers <= 0.23.0
+    if tv >= (4,57,0) and not ((0,22,0) <= kv <= (0,23,0)):
+        print(f"[entrypoint][FATAL] transformers {transformers.__version__} incompatible with tokenizers {tokenizers.__version__}", flush=True)
+        sys.exit(2)
+except Exception as e:
+    print(f"[entrypoint][WARN] HF pair check skipped: {e}", flush=True)
+PY
+
+# ----------------------------
+# Старт приложения
+# ----------------------------
+exec python -m uvicorn apps.tilt_api:app --host "$HOST" --port "$PORT"
