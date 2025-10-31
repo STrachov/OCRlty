@@ -12,6 +12,7 @@ __pycache__/
 /.runpod/
 /.cache/
 /venv/
+/old/
 /.ssh/
 /notebooks/gpu/samples/**/src/
 
