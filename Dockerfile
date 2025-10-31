@@ -6,15 +6,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace
 
-ARG WHEEL_URL="https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/vllm-0.8.3-cp310-cp310-linux_x86_64.whl"
+ARG VLLM_WHEEL_URL="https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/vllm-0.8.3-cp310-cp310-linux_x86_64.whl"
 
 
 RUN set -eux; \
-  curl -fL \
-    ${WHEEL_URL} \
-    -o /tmp/vllm.whl; \
-  PIP_NO_INDEX=1 pip install --no-deps --no-cache-dir /tmp/vllm.whl; \
-  rm -f /tmp/vllm.whl
+    FILENAME="$(basename "$VLLM_WHEEL_URL")"; \
+    curl -fL "$VLLM_WHEEL_URL" -o "/tmp/${FILENAME}"; \
+    PIP_NO_INDEX=1 python -m pip install --no-deps --no-cache-dir "/tmp/${FILENAME}"; \
+    rm -f "/tmp/${FILENAME}"
+
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
