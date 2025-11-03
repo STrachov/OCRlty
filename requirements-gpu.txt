@@ -1,6 +1,6 @@
 # -------------------- HF / vLLM stack --------------------
 transformers==4.57.1
-tokenizers==0.23.0
+tokenizers==0.22.1
 huggingface_hub>=0.23,<1.0
 sentencepiece>=0.1.99
 tiktoken>=0.6
