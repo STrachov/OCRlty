@@ -1,5 +1,4 @@
 # -------------------- HF / vLLM stack --------------------
-# Совместимая пара, чтобы исключить конфликт с vLLM/transformers при импорте
 transformers==4.57.1
 tokenizers==0.23.0
 huggingface_hub>=0.23,<1.0
@@ -17,7 +16,6 @@ numpy>=1.25,<3
 pandas>=2.3,<3
 
 # -------------------- OCR / PDF --------------------
-# НЕ добавляем opencv-python, чтобы не конфликтовать с contrib-сборкой
 paddlepaddle-gpu==2.6.1
 paddleocr>=3.3,<4.0
 opencv-contrib-python-headless==4.10.0.84

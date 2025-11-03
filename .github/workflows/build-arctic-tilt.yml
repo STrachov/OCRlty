@@ -50,7 +50,7 @@ jobs:
           tags: |
             ${{ env.IMAGE }}
             ghcr.io/strachov/arctic-tilt:latest
-            ghcr.io/strachov/arctic-tilt:${{ env.DATE }}-${{ env.GIT_SHA }}
+            ghcr.io/strachov/arctic-tilt:${{ env.DATE }}-a1
           labels: |
             org.opencontainers.image.source=${{ github.repositoryUrl }}
             org.opencontainers.image.revision=${{ github.sha }}
