@@ -28,10 +28,9 @@ RUN set -eux; F="$(basename "$VLLM_WHL_URL")"; \
     echo "${VLLM_WHL_SHA256}  /tmp/${F}" | sha256sum -c -; \
     python3.10 -m pip install "/tmp/${F}"; \
     rm -f "/tmp/${F}"
-RUN python3.10 - <<'PY'
-    import vllm, msgspec, cachetools
-    print("vLLM ok;", getattr(vllm,"__version__","?"), msgspec.__version__, cachetools.__version__)
-    PY
+RUN python3.10 -c "import vllm, msgspec, cachetools; \
+    print('vLLM ok;', getattr(vllm,'__version__','?'), msgspec.__version__, cachetools.__version__)"
+    
     
 # Код приложения
 RUN mkdir -p /workspace/src /workspace/cache/hf
