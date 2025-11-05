@@ -6,8 +6,7 @@ set -euo pipefail
 : "${HF_HOME:=/workspace/cache/hf}"
 : "${HOST:=0.0.0.0}"
 : "${PORT:=8001}"
-# Если нужно пересоздать venv, передай VENV_RESET=1 (или true/yes)
-: "${VENV_RESET:=}"
+: "${VENV_RESET:=}"   # 1|true|yes => пересоздать venv
 
 export HF_HOME
 mkdir -p "$HF_HOME"
@@ -18,32 +17,34 @@ if [[ ! -f "$APP_FILE" ]]; then
   exit 1
 fi
 
-# --- ТОЛЬКО ПО ЗАПРОСУ пересоздаём venv ---
+# --- reset venv по флагу ---
 case "${VENV_RESET,,}" in
   1|true|yes)
     echo "[entrypoint] VENV_RESET is set → recreating venv at $VENV_DIR"
     rm -rf "$VENV_DIR"
   ;;
-  *)
-    : # ничего не делаем
-  ;;
 esac
 
-# Создаём venv, если его нет (по умолчанию используем существующий как есть)
+# --- создаём/активируем venv (по умолчанию переиспользуем) ---
 if [[ ! -d "$VENV_DIR/bin" ]]; then
   python3.10 -m venv "$VENV_DIR" --system-site-packages
 fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
-# Опциональная проверка vLLM (оставил как раньше; можно убрать, если не нужна)
+# нормализуем странный ввод из UI: VLLM_PLUGINS='""' -> empty
+if [[ "${VLLM_PLUGINS:-}" == '""' ]]; then export VLLM_PLUGINS=; fi
+echo "[entrypoint] VLLM_PLUGINS=$(printf %q "${VLLM_PLUGINS:-}")"
+echo "[entrypoint] VLLM_SKIP_PROFILE_RUN=${VLLM_SKIP_PROFILE_RUN:-}"
+
+# быстрый импорт-чек vLLM
 python - <<'PY'
 import sys
 try:
     import vllm
-    print(f"[entrypoint] vLLM OK: {getattr(vllm, '__version__', 'unknown')}")
+    print(f"[entrypoint] vLLM OK:", getattr(vllm,"__version__","unknown"))
 except Exception as e:
-    print(f"[entrypoint][FATAL] vLLM not importable: {e}")
+    print(f"[entrypoint][FATAL] vLLM not importable:", e)
     sys.exit(2)
 PY
 
