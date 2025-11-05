@@ -28,28 +28,26 @@ RUN set -eux; \
     python3.10 -m pip install --no-cache-dir "/tmp/${F}"; \
     rm -f "/tmp/${F}"
 
-# ---- sitecustomize: фикс profile_run для TILT при флаге ----
-RUN python3.10 - <<'PY'
-from pathlib import Path
-p = Path('/usr/local/lib/python3.10/dist-packages/sitecustomize.py')
-p.write_text('''# auto-generated
-import os, importlib
-# Если в UI ввели две кавычки, нормализуем в пустую строку:
-if os.environ.get("VLLM_PLUGINS","") == '""':
-    os.environ["VLLM_PLUGINS"] = ""
-# По флагу вырубаем "тёплый" прогон TILT (vLLM 0.8.3)
-if os.environ.get("VLLM_SKIP_PROFILE_RUN","") in ("1","true","yes","on"):
-    try:
-        tmr = importlib.import_module("vllm.worker.tilt_model_runner")
-        def _no_profile(self):
-            print("[sitecustomize] Skipping TILT profile_run (VLLM_SKIP_PROFILE_RUN=1)")
-            return
-        setattr(tmr.TiltModelRunner, "profile_run", _no_profile)
-    except Exception as e:
-        print("[sitecustomize] Could not patch TiltModelRunner.profile_run:", e)
-''')
-print("Created", p)
+COPY sitecustomize.py /workspace/src/sitecustomize.py
+
+# Гарантируем, что /workspace/src виден Python'у до старта uvicorn
+ENV PYTHONPATH=/workspace/src:$PYTHONPATH
+
+# (опционально) sanity-check прямо на сборке, что sitecustomize исполнился и патчится
+# Здесь выставим флаг только на время проверки
+RUN VLLM_SKIP_PROFILE_RUN=1 python3.10 - <<'PY'
+import importlib
+import vllm
+import vllm.worker.tilt_model_runner as tmr
+patched_any = []
+for _, obj in vars(tmr).items():
+    if isinstance(obj, type) and hasattr(obj, "profile_run"):
+        fn = getattr(obj, "profile_run")
+        # наш _noop без констант и с одним аргументом self — простейшая проверка
+        patched_any.append(getattr(fn, "__code__", None) and fn.__code__.co_argcount == 1)
+print("[build-check] vLLM:", getattr(vllm, "__version__", "?"), "tilt patched any:", any(patched_any))
 PY
+
 
 # ---- sanity-check, чтобы падать на этапе сборки, а не в поде ----
 RUN python3.10 - <<'PY'

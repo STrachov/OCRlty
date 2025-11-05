@@ -27,7 +27,7 @@ jobs:
 
       - name: Set build metadata
         run: |
-          echo "DATE=$(date -u +'%Y-%m-%d')" >> $GITHUB_ENV
+          echo "DATE=$(date -u +'%Y-%m-%d-%H%M%S')" >> $GITHUB_ENV
           echo "GIT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
 
       - name: Login to GHCR
@@ -50,7 +50,7 @@ jobs:
           tags: |
             ${{ env.IMAGE }}
             ghcr.io/strachov/arctic-tilt:latest
-            ghcr.io/strachov/arctic-tilt:${{ env.DATE }}-a1
+            ghcr.io/strachov/arctic-tilt:${{ env.DATE }}
           labels: |
             org.opencontainers.image.source=${{ github.repositoryUrl }}
             org.opencontainers.image.revision=${{ github.sha }}
