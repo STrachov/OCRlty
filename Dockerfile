@@ -2,7 +2,7 @@ FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ENV PIP_NO_CACHE_DIR=1 PIP_ROOT_USER_ACTION=ignore PYTHONUNBUFFERED=1
-
+ENV VLLM_PLUGINS=""
 # Python 3.10 + базовые утилиты + tini
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 python3.10-venv python3.10-dev python3-pip \
