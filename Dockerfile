@@ -26,9 +26,13 @@ ARG VLLM_WHL_SHA256="c0f53b29a7c2b79a86d45fed8770b4164b46dfe5cda5bc4cd375bb86f33
 RUN set -eux; F="$(basename "$VLLM_WHL_URL")"; \
     curl -fL "$VLLM_WHL_URL" -o "/tmp/${F}"; \
     echo "${VLLM_WHL_SHA256}  /tmp/${F}" | sha256sum -c -; \
-    python3.10 -m pip install --no-deps "/tmp/${F}"; \
+    python3.10 -m pip install "/tmp/${F}"; \
     rm -f "/tmp/${F}"
-
+RUN python3.10 - <<'PY'
+    import vllm, msgspec, cachetools
+    print("vLLM ok;", getattr(vllm,"__version__","?"), msgspec.__version__, cachetools.__version__)
+    PY
+    
 # Код приложения
 RUN mkdir -p /workspace/src /workspace/cache/hf
 COPY . /workspace/src
