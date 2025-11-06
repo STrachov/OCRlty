@@ -24,15 +24,14 @@ case "${VENV_RESET,,}" in
     rm -rf "$VENV_DIR"
   ;;
 esac
-
-# --- создаём/активируем venv (по умолчанию переиспользуем) ---
+# --- создаём/активируем venv (БЕЗ --system-site-packages!) ---
 if [[ ! -d "$VENV_DIR/bin" ]]; then
-  python3.10 -m venv "$VENV_DIR" --system-site-packages
+  python3.10 -m venv "$VENV_DIR"
 fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
-# после создания/активации venv:
+# --- кладём наш sitecustomize в site-packages venv ---
 SITE_SRC="${SRC_DIR}/sitecustomize.py"
 SITE_DST="$VENV_DIR/lib/python3.10/site-packages/sitecustomize.py"
 if [[ -f "$SITE_SRC" ]]; then
@@ -40,13 +39,15 @@ if [[ -f "$SITE_SRC" ]]; then
   cp -f "$SITE_SRC" "$SITE_DST"
 fi
 
-# проверка: новый интерпретатор должен напечатать строку из sitecustomize
+# На всякий случай ставим наш src в самый ПЕРВЫЙ элемент sys.path
+export PYTHONPATH="$SRC_DIR:$VENV_DIR/lib/python3.10/site-packages:${PYTHONPATH:-}"
+
+# --- проверка: покажи, ОТКУДА импортировался sitecustomize ---
 python - <<'PY'
-import sys
+import sys, importlib
 print("[probe] sys.executable:", sys.executable)
-# Если sitecustomize импортировался автоматически, его print уже появится выше.
-# На всякий случай дожмём ручным импортом (идемпотентно):
-import sitecustomize  # noqa
+m = importlib.import_module("sitecustomize")
+print("[probe] sitecustomize loaded from:", getattr(m, "__file__", "<builtin>"))
 PY
 
 # нормализуем странный ввод из UI: VLLM_PLUGINS='""' -> empty
