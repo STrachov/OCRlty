@@ -72,6 +72,10 @@ ENV HF_HOME=/workspace/cache/hf \
     PORT=8001 \
     VLLM_PLUGINS=
 
+ENV VLLM_ATTENTION_BACKEND=TORCH \
+    VLLM_USE_FLASH_ATTENTION=0 \
+    VLLM_USE_TRITON_FLASH_ATTN=0 
+
 EXPOSE 8001
 
 # ---- Entrypoint: tini как PID1 + наш скрипт ----

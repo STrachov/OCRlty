@@ -32,6 +32,23 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
+# после создания/активации venv:
+SITE_SRC="${SRC_DIR}/sitecustomize.py"
+SITE_DST="$VENV_DIR/lib/python3.10/site-packages/sitecustomize.py"
+if [[ -f "$SITE_SRC" ]]; then
+  mkdir -p "$(dirname "$SITE_DST")"
+  cp -f "$SITE_SRC" "$SITE_DST"
+fi
+
+# проверка: новый интерпретатор должен напечатать строку из sitecustomize
+python - <<'PY'
+import sys
+print("[probe] sys.executable:", sys.executable)
+# Если sitecustomize импортировался автоматически, его print уже появится выше.
+# На всякий случай дожмём ручным импортом (идемпотентно):
+import sitecustomize  # noqa
+PY
+
 # нормализуем странный ввод из UI: VLLM_PLUGINS='""' -> empty
 if [[ "${VLLM_PLUGINS:-}" == '""' ]]; then export VLLM_PLUGINS=; fi
 echo "[entrypoint] VLLM_PLUGINS=$(printf %q "${VLLM_PLUGINS:-}")"
