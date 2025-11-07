@@ -1,70 +1,110 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${SRC_DIR:=/workspace/src}"
-: "${VENV_DIR:=/workspace/venv}"
-: "${HF_HOME:=/workspace/cache/hf}"
-: "${HOST:=0.0.0.0}"
-: "${PORT:=8001}"
-: "${VENV_RESET:=}"   # 1|true|yes => пересоздать venv
+VENV_DIR="/workspace/venv"
 
-export HF_HOME
-mkdir -p "$HF_HOME"
+echo "[entrypoint] Recreating venv at $VENV_DIR"
+rm -rf "$VENV_DIR" || true
+python3.10 -m venv --system-site-packages "$VENV_DIR"
 
-APP_FILE="$SRC_DIR/apps/tilt_api.py"
-if [[ ! -f "$APP_FILE" ]]; then
-  echo "[entrypoint] ERROR: $APP_FILE is missing in image."
-  exit 1
-fi
-
-# --- reset venv по флагу ---
-case "${VENV_RESET,,}" in
-  1|true|yes)
-    echo "[entrypoint] VENV_RESET is set → recreating venv at $VENV_DIR"
-    rm -rf "$VENV_DIR"
-  ;;
-esac
-# --- создаём/активируем venv (БЕЗ --system-site-packages!) ---
-if [[ ! -d "$VENV_DIR/bin" ]]; then
-  python3.10 -m venv "$VENV_DIR"
-fi
-# shellcheck disable=SC1091
+# shellcheck source=/dev/null
 source "$VENV_DIR/bin/activate"
 
-# --- кладём наш sitecustomize в site-packages venv ---
-SITE_SRC="${SRC_DIR}/sitecustomize.py"
-SITE_DST="$VENV_DIR/lib/python3.10/site-packages/sitecustomize.py"
-if [[ -f "$SITE_SRC" ]]; then
-  mkdir -p "$(dirname "$SITE_DST")"
-  cp -f "$SITE_SRC" "$SITE_DST"
-fi
+# Гарантируем доступ к твоему коду
+export PYTHONPATH="/workspace/src:${PYTHONPATH:-}"
 
-# На всякий случай ставим наш src в самый ПЕРВЫЙ элемент sys.path
-export PYTHONPATH="$SRC_DIR:$VENV_DIR/lib/python3.10/site-packages:${PYTHONPATH:-}"
-
-# --- проверка: покажи, ОТКУДА импортировался sitecustomize ---
+# Создадим .pth + модуль патча, который:
+#  1) форсит env для SDPA/disable FA
+#  2) глушит TILTModelRunner.profile_run(), чтобы не падало на flash_attn в профайле
 python - <<'PY'
-import sys, importlib
-print("[probe] sys.executable:", sys.executable)
-m = importlib.import_module("sitecustomize")
-print("[probe] sitecustomize loaded from:", getattr(m, "__file__", "<builtin>"))
-PY
+import os, sys, site, textwrap, importlib, subprocess
 
-# нормализуем странный ввод из UI: VLLM_PLUGINS='""' -> empty
-if [[ "${VLLM_PLUGINS:-}" == '""' ]]; then export VLLM_PLUGINS=; fi
-echo "[entrypoint] VLLM_PLUGINS=$(printf %q "${VLLM_PLUGINS:-}")"
-echo "[entrypoint] VLLM_SKIP_PROFILE_RUN=${VLLM_SKIP_PROFILE_RUN:-}"
+sp = site.getsitepackages()[0]
+pth_path = os.path.join(sp, "tilt_startup_patch.pth")
+mod_path = os.path.join(sp, "tilt_startup_patch.py")
 
-# быстрый импорт-чек vLLM
-python - <<'PY'
-import sys
+patch_code = textwrap.dedent(r"""
+import os
+# Жёсткие флажки до любых импортов vllm
+os.environ.setdefault("VLLM_SKIP_PROFILE_RUN", "1")
+os.environ.setdefault("VLLM_DISABLE_PLUGINS", "1")
+os.environ.setdefault("VLLM_PLUGINS", "")
+os.environ.setdefault("VLLM_USE_FLASH_ATTENTION", "0")
+os.environ.setdefault("VLLM_ATTENTION_BACKEND", "TORCH_SDPA")
+
+# После импорта vllm — отключим profile_run у TILT
+def _patch_tilt_profile_run():
+    try:
+        import importlib
+        mdl = importlib.import_module("vllm.worker.tilt_model_runner")
+        cls = getattr(mdl, "TILTModelRunner", None)
+        if cls and hasattr(cls, "profile_run"):
+            setattr(cls, "profile_run", lambda self: None)
+            print("[tilt_patch] TILTModelRunner.profile_run disabled")
+    except Exception as e:
+        print("[tilt_patch] fail to patch profile_run:", repr(e))
+
+# Если vllm уже импортировали — патчим сейчас, иначе повесим ленивый хук
 try:
-    import vllm
-    print(f"[entrypoint] vLLM OK:", getattr(vllm,"__version__","unknown"))
+    import vllm  # noqa
+    _patch_tilt_profile_run()
+except Exception:
+    import importlib, sys
+    class _Hook(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname == "vllm.worker.tilt_model_runner":
+                # когда модуль реально подгрузится — после него выполним патч
+                spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+                if spec and spec.loader:
+                    orig_exec = spec.loader.exec_module
+                    def _wrapped_exec(m):
+                        orig_exec(m)
+                        # модуль загружен — патчим класс
+                        _patch_tilt_profile_run()
+                    spec.loader.exec_module = _wrapped_exec
+                return spec
+            return None
+    sys.meta_path.insert(0, _Hook())
+""")
+
+os.makedirs(sp, exist_ok=True)
+with open(mod_path, "w", encoding="utf-8") as f:
+    f.write(patch_code)
+with open(pth_path, "w", encoding="utf-8") as f:
+    f.write("import tilt_startup_patch\n")
+
+print("[probe] venv site-packages:", sp)
+print("[probe] wrote:", pth_path, "and", mod_path)
+
+# Диагностика окружения/пакетов
+def show(name: str):
+    try:
+        out = subprocess.check_output([sys.executable, "-m", "pip", "show", name], text=True)
+        print(out.strip())
+    except Exception as e:
+        print(f"{name}: <not installed> ({e})")
+
+print("[probe] sys.executable:", sys.executable)
+print("[probe] PYTHONPATH:", os.environ.get("PYTHONPATH"))
+print("----- pip show vllm -----"); show("vllm")
+print("----- pip show torch -----"); show("torch")
+
+# Проверим, что vllm импортируется и патч применяется уже сейчас
+try:
+    import vllm  # noqa
+    print("[probe] vLLM import OK")
+    # примем патч немедленно (если модуль уже поднимался ранее)
+    try:
+        import vllm.worker.tilt_model_runner as tmr
+        if hasattr(tmr, "TILTModelRunner") and hasattr(tmr.TILTModelRunner, "profile_run"):
+            setattr(tmr.TILTModelRunner, "profile_run", lambda self: None)
+            print("[probe] TILTModelRunner.profile_run disabled (eager)")
+    except Exception as e:
+        print("[probe] eager patch failed:", repr(e))
 except Exception as e:
-    print(f"[entrypoint][FATAL] vLLM not importable:", e)
-    sys.exit(2)
+    print("[entrypoint][FATAL] vLLM not importable:", e)
+    raise
 PY
 
-export PYTHONPATH="$SRC_DIR:${PYTHONPATH:-}"
-exec python -m uvicorn apps.tilt_api:app --host "$HOST" --port "$PORT"
+echo "[entrypoint] vLLM OK — starting API…"
+exec python -m uvicorn tilt_api:app --host 0.0.0.0 --port 8001
