@@ -56,9 +56,7 @@ RUN python -m pip install --no-cache-dir -r /workspace/requirements-gpu.txt
 # sitecustomize: включится автоматически при старте любого python-процесса
 COPY sitecustomize.py /workspace/sitecustomize.py
 
-# исходники API (должна существовать папка src в репо)
-# если её нет — GitHub Actions упадёт на этом шаге (ожидаемо)
-COPY src /workspace/src
+COPY . /workspace/src
 
 # entrypoint
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
