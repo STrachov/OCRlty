@@ -35,18 +35,19 @@ ENV PATH="/workspace/venv/bin:${PATH}"
 
 # Устанавливаем Torch 2.6.0 + cu124 под cp310
 RUN python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu124 \
-      torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+      torch==2.6.0 
 
 # ---- vLLM из твоего колеса (cp310) с проверкой sha256 ----
-ARG VLLM_WHEEL_URL="https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/vllm-0.8.3-cp310-cp310-linux_x86_64.whl"
+ARG VLLM_WHEEL_NAME="vllm-0.8.3-cp310-cp310-linux_x86_64.whl"
+ARG VLLM_WHEEL_URL="https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/${VLLM_WHEEL_NAME}"
 ARG VLLM_WHEEL_SHA256="c0f53b29a7c2b79a86d45fed8770b4164b46dfe5cda5bc4cd375bb86f3335811"
-
+ 
 RUN set -euo pipefail; \
     echo "[fetch] ${VLLM_WHEEL_URL}"; \
-    curl -L -o /tmp/vllm.whl "${VLLM_WHEEL_URL}"; \
-    echo "${VLLM_WHEEL_SHA256}  /tmp/vllm.whl" | sha256sum -c -; \
-    python -m pip install --no-cache-dir --no-deps -U /tmp/vllm.whl; \
-    rm -f /tmp/vllm.whl
+    curl -L -o "/tmp/${VLLM_WHEEL_NAME}" "${VLLM_WHEEL_URL}"; \
+    echo "${VLLM_WHEEL_SHA256}  /tmp/${VLLM_WHEEL_NAME}" | sha256sum -c -; \
+    python -m pip install --no-cache-dir --no-deps -U "/tmp/${VLLM_WHEEL_NAME}"; \
+    rm -f "/tmp/${VLLM_WHEEL_NAME}"
 
 # Остальные зависимости проекта (без torch/vllm)
 WORKDIR /workspace
