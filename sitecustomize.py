@@ -1,38 +1,48 @@
 """
 sitecustomize.py
-Автозагружается Python’ом до всего остального.
-Здесь мы:
-  1) форсим безопасные для vLLM режимы (SDPA, без flash-attn),
-  2) отключаем TILT profile_run монкипатчем,
-  3) печатаем диагностическую строку чтобы видеть, что файл реально подхватился.
+Автоматически подхватывается Python'ом при старте (благодаря PYTHONPATH=/workspace).
+Делает два дела:
+1) Форсит бэкенд внимания vLLM = SDPA (без Flash-Attn/xformers)
+2) Выключает profile_run() у TILT-модели (патчит vLLM), если VLLM_SKIP_PROFILE_RUN=1
 """
+
 import os
 import sys
+import builtins
+import importlib
 
-print(f"[sitecustomize] Loaded sitecustomize from: {__file__}")
-
-# 1) среда для внимания и профайлинга
-os.environ.setdefault("VLLM_USE_FLASH_ATTENTION", "0")
-os.environ.setdefault("VLLM_ATTENTION_BACKEND", "TORCH_SDPA")
+# Безопасные дефолты
+os.environ.setdefault("VLLM_ATTENTION_BACKEND", "SDPA")
 os.environ.setdefault("VLLM_SKIP_PROFILE_RUN", "1")
-# На всякий случай глушим любые плагины
-os.environ.setdefault("VLLM_PLUGINS", "")
 
-# 2) монкипатч: отключить profile_run у TILT, если он есть
-try:
-    # импортируем по месту, чтобы не грузить лишнее, но достаточно рано
-    import importlib
-    tmr = importlib.import_module("vllm.worker.tilt_model_runner")  # type: ignore
-    ModelRunner = getattr(tmr, "ModelRunner", None)
-    if ModelRunner and hasattr(ModelRunner, "profile_run"):
-        def _no_profile_run(self, *args, **kwargs):
-            try:
-                # Логируем только один раз, без зависимостей от loguru
-                sys.stderr.write("[sitecustomize] TILT profile_run is DISABLED by sitecustomize.\n")
-            except Exception:
-                pass
-            return None
-        setattr(ModelRunner, "profile_run", _no_profile_run)
-        print("[sitecustomize] Patched vllm.worker.tilt_model_runner.ModelRunner.profile_run -> no-op")
-except Exception as e:
-    print(f"[sitecustomize][WARN] Could not patch TILT profile_run: {e}")
+def _patch_tilt_profile_run():
+    """Меняем TILTModelRunner.profile_run на no-op при включённом флаге."""
+    if os.getenv("VLLM_SKIP_PROFILE_RUN") not in ("1", "true", "True", "YES", "yes"):
+        return
+    try:
+        import vllm.worker.tilt_model_runner as tmr
+        if hasattr(tmr, "TILTModelRunner"):
+            def _no_profile(self):
+                try:
+                    from loguru import logger
+                    logger.info("sitecustomize: TILT profile_run() skipped")
+                except Exception:
+                    sys.stderr.write("sitecustomize: TILT profile_run() skipped\n")
+                return None
+            tmr.TILTModelRunner.profile_run = _no_profile
+            sys.stderr.write("sitecustomize: patched TILTModelRunner.profile_run -> no-op\n")
+    except Exception as e:
+        # молча — патч сработает через import hook ниже
+        pass
+
+# Пытаемся пропатчить сразу (если vllm уже доступен)
+_patch_tilt_profile_run()
+
+# А также ставим простой import-hook, чтобы патч применился при ПЕРВОМ импорте vllm
+_orig_import = builtins.__import__
+def _hooked_import(name, *args, **kwargs):
+    mod = _orig_import(name, *args, **kwargs)
+    if name.startswith("vllm"):
+        _patch_tilt_profile_run()
+    return mod
+builtins.__import__ = _hooked_import

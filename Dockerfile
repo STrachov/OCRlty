@@ -1,53 +1,68 @@
-FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+# CUDA 12.4 + cuDNN runtime (Ubuntu 22.04)
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
-# Базовые переменные окружения
-ENV PYTHONUNBUFFERED=1 \
+ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
     HF_HOME=/workspace/cache/hf \
-    UVICORN_HOST=0.0.0.0 \
-    UVICORN_PORT=8001 \
-    # Жёстко запрещаем flash-attn и форсим SDPA
-    VLLM_USE_FLASH_ATTENTION=0 \
-    VLLM_ATTENTION_BACKEND=TORCH_SDPA \
-    # Пробуем отключить прогон профайла у TILT (а также делаем монкипатчем в sitecustomize)
-    VLLM_SKIP_PROFILE_RUN=1
+    # vLLM окружение
+    VLLM_SKIP_PROFILE_RUN=1 \
+    VLLM_PLUGINS="" \
+    VLLM_ATTENTION_BACKEND=SDPA \
+    # чтобы Python автоматически нашёл /workspace/sitecustomize.py
+    PYTHONPATH=/workspace
 
-# Системные зависимости (минимум, без графических тулов)
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      tini git ca-certificates curl \
-      libglib2.0-0 libgl1 libxrender1 libxext6 libsm6 \
-    && rm -rf /var/lib/apt/lists/*
+# Базовые утилиты + Python 3.10
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.10 python3.10-venv python3.10-distutils python3.10-minimal \
+      curl ca-certificates git tini && \
+    rm -rf /var/lib/apt/lists/*
 
-# Рабочие каталоги
-RUN mkdir -p /workspace/src /workspace/cache/hf
+# pip под Python 3.10
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
+
+# Проверка
+RUN python3.10 - <<'PY'
+import sys,platform
+assert sys.version_info[:2]==(3,10), sys.version
+print("OK: Python", sys.version, "arch:", platform.machine())
+PY
+
+# Создаём venv и используем ТОЛЬКО его далее
+RUN python3.10 -m venv /workspace/venv && /workspace/venv/bin/python -m pip install --upgrade pip wheel
+
+ENV PATH="/workspace/venv/bin:${PATH}"
+
+# Устанавливаем Torch 2.6.0 + cu124 под cp310
+RUN python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu124 \
+      torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+
+# ---- vLLM из твоего колеса (cp310) с проверкой sha256 ----
+ARG VLLM_WHEEL_URL="https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/vllm-0.8.3-cp310-cp310-linux_x86_64.whl"
+ARG VLLM_WHEEL_SHA256="c0f53b29a7c2b79a86d45fed8770b4164b46dfe5cda5bc4cd375bb86f3335811"
+
+RUN set -euo pipefail; \
+    echo "[fetch] ${VLLM_WHEEL_URL}"; \
+    curl -L -o /tmp/vllm.whl "${VLLM_WHEEL_URL}"; \
+    echo "${VLLM_WHEEL_SHA256}  /tmp/vllm.whl" | sha256sum -c -; \
+    python -m pip install --no-cache-dir --no-deps -U /tmp/vllm.whl; \
+    rm -f /tmp/vllm.whl
+
+# Остальные зависимости проекта (без torch/vllm)
 WORKDIR /workspace
+COPY requirements-gpu.txt /workspace/requirements-gpu.txt
+RUN python -m pip install --no-cache-dir -r /workspace/requirements-gpu.txt
 
-# Ставим/обновляем pip заранее
-RUN python -m pip install --upgrade pip setuptools wheel
+# sitecustomize: включится автоматически при старте любого python-процесса
+COPY sitecustomize.py /workspace/sitecustomize.py
 
-# Подкладываем sitecustomize.py именно в conda-путь Python этого образа
-# (в этих образах Python живёт в /opt/conda/lib/python3.10/)
-COPY sitecustomize.py /opt/conda/lib/python3.10/sitecustomize.py
+# исходники API (должна существовать папка src в репо)
+# если её нет — GitHub Actions упадёт на этом шаге (ожидаемо)
+COPY src /workspace/src
 
-# Ставим зависимости проекта (кроме vLLM/flash-attn/xformers/paddlex — их здесь нет)
-COPY requirements-gpu.txt /tmp/requirements-gpu.txt
-RUN python -m pip install --no-cache-dir -r /tmp/requirements-gpu.txt
-
-# ⚠️ Ставим твой vLLM ТОЧНО из твоего релиза и БЕЗ зависимостей
-# Torch уже есть в базе → исключаем любые перетяжки
-RUN python -m pip install --no-cache-dir --no-deps -U \
-  https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/vllm-0.8.3-cp310-cp310-linux_x86_64.whl
-
-# Кладем весь репозиторий (чтобы не промахнуться с путём src)
-# Если репо тяжёлое — можете сузить до COPY ./src и нужных файлов
-COPY . /workspace
-
-# Делаем entrypoint исполняемым
+# entrypoint
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 EXPOSE 8001
-
-# init-процесс для корректных сигналов
-ENTRYPOINT ["/usr/bin/tini","--"]
-CMD ["/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/entrypoint.sh"]

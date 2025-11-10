@@ -1,56 +1,32 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -euo pipefail
 
-echo "[entrypoint] Python: $(python -V)"
-echo "[entrypoint] Torch:   $(python -c 'import torch,sys;print(torch.__version__)' 2>/dev/null || echo 'not importable')"
-echo "[entrypoint] CUDA:    $(python -c 'import torch;print(torch.version.cuda)' 2>/dev/null || echo 'n/a')"
-echo "[entrypoint] vLLM:    $(python -c 'import vllm,sys;print(vllm.__version__)' 2>/dev/null || echo 'not importable')"
-
-# Жёстко форсим безопасные для нас режимы
-export VLLM_USE_FLASH_ATTENTION=${VLLM_USE_FLASH_ATTENTION:-0}
-export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-TORCH_SDPA}
-export VLLM_SKIP_PROFILE_RUN=${VLLM_SKIP_PROFILE_RUN:-1}
-export HF_HOME=${HF_HOME:-/workspace/cache/hf}
-
-echo "[entrypoint] VLLM_USE_FLASH_ATTENTION=${VLLM_USE_FLASH_ATTENTION}"
-echo "[entrypoint] VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND}"
-echo "[entrypoint] VLLM_SKIP_PROFILE_RUN=${VLLM_SKIP_PROFILE_RUN}"
-echo "[entrypoint] HF_HOME=${HF_HOME}"
-
-# Проверка загрузки sitecustomize и пути
+# Пробные выводы окружения
+echo "[probe] python: $(python -V)"
+echo "[probe] pip: $(pip -V)"
 python - <<'PY'
-import sys, os
-print(f"[probe] sys.executable: {sys.executable}")
+import os, sys
+print("[probe] sys.executable:", sys.executable)
+print("[probe] sys.path[0:3]:", sys.path[:3])
 try:
     import sitecustomize as sc
-    print(f"[probe] sitecustomize loaded from: {sc.__file__}")
+    print("[probe] sitecustomize loaded from:", getattr(sc, "__file__", "<unknown>"))
 except Exception as e:
-    print(f"[probe][WARN] sitecustomize not loaded: {e}")
+    print("[probe] sitecustomize import error:", e)
+print("[probe] VLLM_SKIP_PROFILE_RUN =", os.getenv("VLLM_SKIP_PROFILE_RUN"))
+print("[probe] VLLM_ATTENTION_BACKEND =", os.getenv("VLLM_ATTENTION_BACKEND"))
 PY
 
-# Мини-проверки на импорт
+# Небольшая самопроверка import vllm
 python - <<'PY'
-mods = ["vllm","transformers","fastapi","paddleocr","paddle","numpy","pandas"]
-for m in mods:
-    try:
-        __import__(m)
-        print(f"[probe] import ok: {m}")
-    except Exception as e:
-        print(f"[probe][WARN] import fail: {m}: {e}")
+try:
+    import vllm
+    print("[probe] vllm version OK")
+except Exception as e:
+    import traceback; traceback.print_exc()
+    raise SystemExit("[FATAL] vLLM not importable")
 PY
 
-# На всякий — добавим src в PYTHONPATH (ожидаем apps/tilt_api.py внутри /workspace/src)
-export PYTHONPATH="/workspace/src:${PYTHONPATH:-}"
-
-APP_MODULE="apps.tilt_api:app"
-if [[ ! -f "/workspace/src/apps/tilt_api.py" ]]; then
-  echo "[entrypoint][FATAL] /workspace/src/apps/tilt_api.py not found."
-  echo "                 Проверьте структуру репозитория. Должно быть: src/apps/tilt_api.py"
-  exit 2
-fi
-
-HOST="${UVICORN_HOST:-0.0.0.0}"
-PORT="${UVICORN_PORT:-8001}"
-
-echo "[entrypoint] Starting uvicorn ${APP_MODULE} on ${HOST}:${PORT}"
-exec python -m uvicorn "${APP_MODULE}" --host "${HOST}" --port "${PORT}" --timeout-keep-alive 75
+# Запуск твоего API
+# при необходимости поменяй модуль/путь
+exec python -m uvicorn src.apps.tilt_api:app --host 0.0.0.0 --port 8001
