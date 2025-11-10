@@ -42,7 +42,7 @@ ARG VLLM_WHEEL_NAME="vllm-0.8.3-cp310-cp310-linux_x86_64.whl"
 ARG VLLM_WHEEL_URL="https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/${VLLM_WHEEL_NAME}"
 ARG VLLM_WHEEL_SHA256="c0f53b29a7c2b79a86d45fed8770b4164b46dfe5cda5bc4cd375bb86f3335811"
  
-RUN set -euo pipefail; \
+RUN set -euo; \
     echo "[fetch] ${VLLM_WHEEL_URL}"; \
     curl -L -o "/tmp/${VLLM_WHEEL_NAME}" "${VLLM_WHEEL_URL}"; \
     echo "${VLLM_WHEEL_SHA256}  /tmp/${VLLM_WHEEL_NAME}" | sha256sum -c -; \
