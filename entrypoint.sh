@@ -2,16 +2,16 @@
 set -euo pipefail
 
 # Всегда предпочитаем venv-питон
-VENV_PY="/workspace/venv/bin/python"
-if [[ -x "$VENV_PY" ]]; then
-  export PATH="/workspace/venv/bin:${PATH}"
-  PY_BIN="$VENV_PY"
-else
-  # Фоллбек — но в норме до него не дойдём
-  PY_BIN="$(command -v python || true)"
-  [[ -n "${PY_BIN}" ]] || PY_BIN="$(command -v python3 || true)"
-fi
-
+# VENV_PY="/workspace/venv/bin/python"
+# if [[ -x "$VENV_PY" ]]; then
+#   export PATH="/workspace/venv/bin:${PATH}"
+#   PY_BIN="$VENV_PY"
+# else
+#   # Фоллбек — но в норме до него не дойдём
+#   PY_BIN="$(command -v python || true)"
+#   [[ -n "${PY_BIN}" ]] || PY_BIN="$(command -v python3 || true)"
+# fi
+export PATH=/workspace/venv/bin:$PATH
 echo "[probe] python: $(${PY_BIN:-python} -V 2>/dev/null || echo 'not found')"
 echo "[probe] pip: $(pip -V || true)"
 
@@ -33,6 +33,7 @@ if [ ! -d /workspace/src ]; then
   mkdir -p /workspace/src
   cp -a /app/. /workspace/src/
 fi
+
 
 # Запуск API
 cd /workspace/src
