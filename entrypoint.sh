@@ -27,6 +27,13 @@ echo "[entrypoint] VLLM_PLUGINS='${VLLM_PLUGINS:-}'"
 echo "[entrypoint] VLLM_SKIP_PROFILE_RUN=${VLLM_SKIP_PROFILE_RUN:-}"
 echo "[entrypoint] VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-}"
 
+# 1) Если том перекрыл /workspace – положим туда код из образа один раз
+if [ ! -d /workspace/src ]; then
+  echo "[seed] /workspace/src missing -> copy from /app"
+  mkdir -p /workspace/src
+  cp -a /app/. /workspace/src/
+fi
+
 # Запуск API
 cd /workspace/src
 exec ${PY_BIN} -m uvicorn apps.tilt_api:app --host 0.0.0.0 --port 8001

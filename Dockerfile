@@ -59,7 +59,10 @@ RUN python -m pip install --no-cache-dir -r /workspace/requirements-gpu.txt
 # sitecustomize: подключится автоматически при старте любого python-процесса
 COPY sitecustomize.py /workspace/sitecustomize.py
 
-COPY . /workspace/src
+COPY . /app
+
+# важно: чтобы наш sitecustomize находился раньше системного
+ENV PYTHONPATH=/workspace/src:/app
 
 # entrypoint
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
