@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Пробные выводы окружения
-echo "[probe] python: $(python -V)"
-echo "[probe] pip: $(pip -V)"
-python - <<'PY'
-import os, sys
-print("[probe] sys.executable:", sys.executable)
-print("[probe] sys.path[0:3]:", sys.path[:3])
-try:
-    import sitecustomize as sc
-    print("[probe] sitecustomize loaded from:", getattr(sc, "__file__", "<unknown>"))
-except Exception as e:
-    print("[probe] sitecustomize import error:", e)
-print("[probe] VLLM_SKIP_PROFILE_RUN =", os.getenv("VLLM_SKIP_PROFILE_RUN"))
-print("[probe] VLLM_ATTENTION_BACKEND =", os.getenv("VLLM_ATTENTION_BACKEND"))
+# Всегда предпочитаем venv-питон
+VENV_PY="/workspace/venv/bin/python"
+if [[ -x "$VENV_PY" ]]; then
+  export PATH="/workspace/venv/bin:${PATH}"
+  PY_BIN="$VENV_PY"
+else
+  # Фоллбек — но в норме до него не дойдём
+  PY_BIN="$(command -v python || true)"
+  [[ -n "${PY_BIN}" ]] || PY_BIN="$(command -v python3 || true)"
+fi
+
+echo "[probe] python: $(${PY_BIN:-python} -V 2>/dev/null || echo 'not found')"
+echo "[probe] pip: $(pip -V || true)"
+
+# Подхватим sitecustomize и покажем откуда он грузится
+echo "[probe] sitecustomize:"
+${PY_BIN} - <<'PY' || true
+import sitecustomize, sys
+print(getattr(sitecustomize, "__file__", "??"), file=sys.stdout)
 PY
 
-# Небольшая самопроверка import vllm
-python - <<'PY'
-try:
-    import vllm
-    print("[probe] vllm version OK")
-except Exception as e:
-    import traceback; traceback.print_exc()
-    raise SystemExit("[FATAL] vLLM not importable")
-PY
+# Логируем критичные переменные среды
+echo "[entrypoint] VLLM_PLUGINS='${VLLM_PLUGINS:-}'"
+echo "[entrypoint] VLLM_SKIP_PROFILE_RUN=${VLLM_SKIP_PROFILE_RUN:-}"
+echo "[entrypoint] VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-}"
 
-# Запуск твоего API
-# при необходимости поменяй модуль/путь
-exec python -m uvicorn src.apps.tilt_api:app --host 0.0.0.0 --port 8001
+# Запуск API
+cd /workspace/src
+exec ${PY_BIN} -m uvicorn apps.tilt_api:app --host 0.0.0.0 --port 8001
