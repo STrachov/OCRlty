@@ -1,42 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Всегда предпочитаем venv-питон
-VENV_PY="/workspace/venv/bin/python"
-if [[ -x "$VENV_PY" ]]; then
-  echo "[probe] ${VENV_PY} existing"
-  export PATH="/workspace/venv/bin:${PATH}"
-  PY_BIN="$VENV_PY"
-else
-  echo "[probe] ${VENV_PY} NOT existing"
-  # Фоллбек — но в норме до него не дойдём
-  PY_BIN="$(command -v python || true)"
-  [[ -n "${PY_BIN}" ]] || PY_BIN="$(command -v python3 || true)"
-  echo "[probe] real PY_BIN is ${PY_BIN} "
-fi
-echo "[probe] python: $(${PY_BIN:-python} -V 2>/dev/null || echo 'not found')"
-echo "[probe] pip: $(${PY_BIN:-python} -m pip -V 2>/dev/null || echo 'not found for this python')"
+# каталоги под volume/кэши (RunPod монтирует /workspace)
+mkdir -p /workspace/venv /workspace/.cache/pip /workspace/cache/hf
 
-# Подхватим sitecustomize и покажем откуда он грузится
-echo "[probe] sitecustomize:"
-${PY_BIN} - <<'PY' || true
-import sitecustomize, sys
-print(getattr(sitecustomize, "__file__", "??"), file=sys.stdout)
-PY
-
-# Логируем критичные переменные среды
-echo "[entrypoint] VLLM_PLUGINS='${VLLM_PLUGINS:-}'"
-echo "[entrypoint] VLLM_SKIP_PROFILE_RUN=${VLLM_SKIP_PROFILE_RUN:-}"
-echo "[entrypoint] VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-}"
-
-# 1) Если том перекрыл /workspace – положим туда код из образа один раз
-if [ ! -d /workspace/src ]; then
-  echo "[seed] /workspace/src missing -> copy from /app"
-  mkdir -p /workspace/src
-  cp -a /app/. /workspace/src/
+# всегда используем venv на volume, но с доступом к пакетам из /opt/venv (vLLM, torch)
+if [[ ! -x /workspace/venv/bin/python ]]; then
+  python3.10 -m venv --system-site-packages /workspace/venv
+  /workspace/venv/bin/python -m pip install --upgrade pip wheel
+  # проектные зависимости (uvicorn, fastapi, paddleocr и т.д.)
+  /workspace/venv/bin/python -m pip install -r /opt/app/requirements-gpu.txt
 fi
 
+export PATH="/workspace/venv/bin:${PATH}"
+export HF_HOME=/workspace/cache/hf
+export TRANSFORMERS_CACHE=/workspace/cache/hf/hub
+export PIP_CACHE_DIR=/workspace/.cache/pip
+export VLLM_SKIP_PROFILE_RUN=${VLLM_SKIP_PROFILE_RUN:-1}
+export VLLM_PLUGINS=${VLLM_PLUGINS:-}
+export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-SDPA}
 
-# Запуск API
-cd /workspace/src
-exec ${PY_BIN} -m uvicorn apps.tilt_api:app --host 0.0.0.0 --port 8001
+# Запуск API. App-директория: /opt/app, модуль: apps.tilt_api:app
+exec /workspace/venv/bin/python -m uvicorn apps.tilt_api:app \
+  --app-dir /opt/app \
+  --host 0.0.0.0 \
+  --port 8001

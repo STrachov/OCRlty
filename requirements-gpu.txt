@@ -1,4 +1,4 @@
-# -------------------- HF / vLLM stack (без torch/vllm!) --------------------
+# -------------------- HF / vLLM stack --------------------
 transformers==4.57.1
 tokenizers==0.22.1
 huggingface_hub>=0.23,<1.0
@@ -17,7 +17,6 @@ pandas>=2.3,<3
 msgspec>=0.18,<0.20
 
 # -------------------- OCR / PDF --------------------
-# PADDLEX НЕ СТАВИМ! (чтобы не подтягивался vllm plugin)
 paddlepaddle-gpu==2.6.1
 paddleocr>=3.3,<4.0
 opencv-contrib-python-headless==4.10.0.84
