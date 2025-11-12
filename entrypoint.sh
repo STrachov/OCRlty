@@ -2,18 +2,20 @@
 set -euo pipefail
 
 # Всегда предпочитаем venv-питон
-# VENV_PY="/workspace/venv/bin/python"
-# if [[ -x "$VENV_PY" ]]; then
-#   export PATH="/workspace/venv/bin:${PATH}"
-#   PY_BIN="$VENV_PY"
-# else
-#   # Фоллбек — но в норме до него не дойдём
-#   PY_BIN="$(command -v python || true)"
-#   [[ -n "${PY_BIN}" ]] || PY_BIN="$(command -v python3 || true)"
-# fi
-export PATH=/workspace/venv/bin:$PATH
+VENV_PY="/workspace/venv/bin/python"
+if [[ -x "$VENV_PY" ]]; then
+  echo "[probe] ${VENV_PY} existing"
+  export PATH="/workspace/venv/bin:${PATH}"
+  PY_BIN="$VENV_PY"
+else
+  echo "[probe] ${VENV_PY} NOT existing"
+  # Фоллбек — но в норме до него не дойдём
+  PY_BIN="$(command -v python || true)"
+  [[ -n "${PY_BIN}" ]] || PY_BIN="$(command -v python3 || true)"
+  echo "[probe] real PY_BIN is ${PY_BIN} "
+fi
 echo "[probe] python: $(${PY_BIN:-python} -V 2>/dev/null || echo 'not found')"
-echo "[probe] pip: $(pip -V || true)"
+echo "[probe] pip: $(${PY_BIN:-python} -m pip -V 2>/dev/null || echo 'not found for this python')"
 
 # Подхватим sitecustomize и покажем откуда он грузится
 echo "[probe] sitecustomize:"
