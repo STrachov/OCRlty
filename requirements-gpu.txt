@@ -4,6 +4,8 @@ tokenizers==0.22.1
 huggingface_hub>=0.23,<1.0
 sentencepiece>=0.1.99
 tiktoken>=0.6
+cachetools>=5,<6
+einops>=0.7
 
 # -------------------- API / runtime --------------------
 fastapi>=0.120,<1.0
