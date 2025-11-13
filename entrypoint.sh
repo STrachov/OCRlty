@@ -6,11 +6,21 @@ mkdir -p /workspace/venv /workspace/.cache/pip /workspace/cache/hf
 
 # всегда используем venv на volume, но с доступом к пакетам из /opt/venv (vLLM, torch)
 if [[ ! -x /workspace/venv/bin/python ]]; then
-  python3.10 -m venv --system-site-packages /workspace/venv
+  python3.10 -m venv /workspace/venv
   /workspace/venv/bin/python -m pip install --upgrade pip wheel
-  # проектные зависимости (uvicorn, fastapi, paddleocr и т.д.)
   /workspace/venv/bin/python -m pip install -r /opt/app/requirements-gpu.txt
 fi
+
+# 2) подмешиваем пакеты из /opt/venv (там vLLM + torch)
+export PYTHONPATH="/opt/venv/lib/python3.10/site-packages:${PYTHONPATH:-}"
+# 3) используем именно /workspace/venv/python
+export PATH="/workspace/venv/bin:${PATH}"
+
+# (необязательно, но полезно один раз увидеть в логах)
+/workspace/venv/bin/python - <<'PY'
+import vllm, torch; print("vLLM:", vllm.__version__, "torch:", torch.__version__)
+PY
+
 
 export PATH="/workspace/venv/bin:${PATH}"
 export HF_HOME=/workspace/cache/hf
