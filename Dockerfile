@@ -30,7 +30,8 @@ RUN python -m venv /opt/venv && \
 # Torch 2.6.0 (CUDA 12.4) строго из официального индекса
 RUN /opt/venv/bin/python -m pip install --no-cache-dir \
       --index-url https://download.pytorch.org/whl/cu124 \
-      torch==2.6.0
+      torch==2.6.0 torchvision==0.21.0
+
 
 # Аргументы для твоего колеса vLLM
 ARG VLLM_WHEEL_NAME="vllm-0.8.3-cp310-cp310-linux_x86_64.whl"
