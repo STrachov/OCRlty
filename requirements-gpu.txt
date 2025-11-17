@@ -39,3 +39,4 @@ packaging>=24
 filelock>=3.12
 pyyaml>=6
 tqdm>=4.66
+pyzmq>=25,<26
