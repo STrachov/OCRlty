@@ -14,9 +14,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Базовые утилиты + Python 3.10 + tini
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3.10 python3.10-venv python3.10-distutils python3.10-minimal \
-      ca-certificates curl git tini && \
-    rm -rf /var/lib/apt/lists/*
+    python3.10 python3.10-venv python3.10-distutils python3.10-minimal \
+    curl ca-certificates git tini \
+    build-essential ninja-build cmake git \
+  && rm -rf /var/lib/apt/lists/*
 
 # pip под Python 3.10 и удобный алиас "python"
 RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 && \
