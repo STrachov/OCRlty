@@ -48,6 +48,7 @@ async-timeout>=4,<5
 frozenlist>=1.4,<2
 multidict>=6,<7
 yarl>=1.9,<2
+gguf>=0.10,<1.0
 
 # quality-of-life (обычно используются логгер/сериализация)
 rich>=13,<14
