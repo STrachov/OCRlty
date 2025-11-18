@@ -33,6 +33,12 @@ RUN /opt/venv/bin/python -m pip install --no-cache-dir \
       --index-url https://download.pytorch.org/whl/cu124 \
       torch==2.6.0 torchvision==0.21.0
 
+# ---- shim для xformers, чтобы импорт не падал (мы используем SDPA) ----
+RUN mkdir -p /opt/shims/xformers && \
+    printf 'class _Ops:\n    pass\nops=_Ops()\n__all__=["ops"]\n' > /opt/shims/xformers/__init__.py
+# чтобы шим брался раньше, чем site-packages
+ENV PYTHONPATH="/opt/shims:${PYTHONPATH}"
+
 
 # Аргументы для твоего колеса vLLM
 ARG VLLM_WHEEL_NAME="vllm-0.8.3-cp310-cp310-linux_x86_64.whl"
