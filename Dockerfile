@@ -1,61 +1,67 @@
-# CUDA 12.4 + cuDNN runtime (Ubuntu 22.04)
+# Базовый образ: CUDA 12.4 + cuDNN, Ubuntu 22.04
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/workspace/cache/hf \
-    TRANSFORMERS_CACHE=/workspace/cache/hf/hub \
-    PIP_CACHE_DIR=/workspace/.cache/pip \
-    PIP_NO_CACHE_DIR=0 \
-    # vLLM окружение
-    VLLM_SKIP_PROFILE_RUN=1 \
-    VLLM_PLUGINS="" \
-    VLLM_ATTENTION_BACKEND=SDPA
+    PIP_NO_CACHE_DIR=1 \
+    # мы хотим всегда xformers
+    VLLM_ATTENTION_BACKEND=XFORMERS \
+    # profile_run у TILT отключаем через sitecustomize
+    VLLM_SKIP_PROFILE_RUN=1
 
-# Базовые утилиты + Python 3.10 + tini
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3.10-venv python3.10-distutils python3.10-minimal \
-    curl ca-certificates git tini \
-    build-essential ninja-build cmake git \
-  && rm -rf /var/lib/apt/lists/*
+# ----------------------- 1. Базовая система + Python 3.10 ---------------------
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3.10 \
+        python3.10-venv \
+        python3-pip \
+        git \
+        curl \
+        ca-certificates \
+        tini \
+        build-essential \
+        pkg-config \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && ln -sf /usr/bin/pip3 /usr/bin/pip \
+    && rm -rf /var/lib/apt/lists/*
 
-# pip под Python 3.10 и удобный алиас "python"
-RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 && \
-    ln -sf /usr/bin/python3.10 /usr/local/bin/python && \
-    python -V && pip -V
+# Каталоги под кеши HF и pip (RunPod volume обычно монтится в /workspace)
+RUN mkdir -p /workspace/cache/hf /workspace/.cache/pip
 
-# === /opt/venv: "запечённый" venv с Torch+vLLM ===
-RUN python -m venv /opt/venv && \
-    /opt/venv/bin/python -m pip install --upgrade pip wheel
-
-# Torch 2.6.0 (CUDA 12.4) строго из официального индекса
-RUN /opt/venv/bin/python -m pip install --no-cache-dir \
-      --index-url https://download.pytorch.org/whl/cu124 \
-      torch==2.6.0 torchvision==0.21.0
-
-# ---- shim для xformers, чтобы импорт не падал (мы используем SDPA) ----
-RUN mkdir -p /opt/shims/xformers && \
-    printf 'class _Ops:\n    pass\nops=_Ops()\n__all__=["ops"]\n' > /opt/shims/xformers/__init__.py
-# чтобы шим брался раньше, чем site-packages
-ENV PYTHONPATH="/opt/shims:${PYTHONPATH}"
-
-
-# Аргументы для твоего колеса vLLM
-ARG VLLM_WHEEL_NAME="vllm-0.8.3-cp310-cp310-linux_x86_64.whl"
-ARG VLLM_WHEEL_URL="https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/${VLLM_WHEEL_NAME}"
-ARG VLLM_WHEEL_SHA256="c0f53b29a7c2b79a86d45fed8770b4164b46dfe5cda5bc4cd375bb86f3335811"
-
-# Ставим vLLM из твоего .whl в /opt/venv (без зависимостей — Torch уже стоит)
-RUN curl -L -o "/tmp/${VLLM_WHEEL_NAME}" "${VLLM_WHEEL_URL}" && \
-    echo "${VLLM_WHEEL_SHA256}  /tmp/${VLLM_WHEEL_NAME}" | sha256sum -c - && \
-    /opt/venv/bin/python -m pip install --no-cache-dir --no-deps -U "/tmp/${VLLM_WHEEL_NAME}" && \
-    rm -f "/tmp/${VLLM_WHEEL_NAME}"
-
-# Проект (весь репозиторий) — в /opt/app
+# ----------------------------- 2. Код проекта ---------------------------------
 WORKDIR /opt/app
 COPY . /opt/app
 
-# entrypoint
+# sitecustomize лежит в корне проекта, Python увидит его по PYTHONPATH/WORKDIR
+# (если в репо он уже есть — COPY выше его тоже привёз)
+
+# ---------------------- 3. venv + установка зависимостей ----------------------
+# Весь питоновский стек ставим ЗДЕСЬ, а не в entrypoint — чтобы поды стартовали быстро
+RUN python3.10 -m venv /opt/venv \
+ && /opt/venv/bin/pip install --upgrade pip wheel \
+ # ставим TORCH / TORCHVISION / TORCHAUDIO
+ && /opt/venv/bin/pip install \
+      torch==2.6.0 \
+      torchvision==0.21.0 \
+      torchaudio==2.6.0 \
+      --index-url https://download.pytorch.org/whl/cu124 \
+ # requirements-gpu.txt: torch 2.6.0+cu124, HF, FastAPI, opencv и прочий стек
+ && /opt/venv/bin/pip install -r requirements-gpu.txt \
+ # vLLM и xformers — готовые колёса из GitHub Release
+ && /opt/venv/bin/pip install --no-deps \
+      https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/vllm-0.8.3-cp310-cp310-linux_x86_64.whl \
+      https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/xformers-0.0.29.post2-cp310-cp310-manylinux_2_28_x86_64.whl
+
+# В рантайме всегда используем /opt/venv/bin/python и видим /opt/app/sitecustomize.py
+ENV PATH=/opt/venv/bin:$PATH \
+    PYTHONPATH=/opt/app:${PYTHONPATH:-}
+
+# ----------------------------- 4. entrypoint ----------------------------------
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
