@@ -1,4 +1,3 @@
-# apps/tilt_api.py
 from __future__ import annotations
 
 import os
@@ -35,8 +34,11 @@ app = FastAPI(title="Arctic-TILT API", version="1.0")
 # -----------------------------------------------------------------------------
 # vLLM (task=tilt_generate)
 # -----------------------------------------------------------------------------
-# IMPORTANT: do NOT call llm.generate() with task=tilt_generate.
-# We must use llm.tilt_generate(inputs=[...], sampling_params=...).
+# ВАЖНО:
+#  - TILT интегрируется через task="tilt_generate" при создании LLM.
+#  - Сам вызов идёт через обычный llm.generate([...], sampling_params=...),
+#    но в prompts/inputs мы передаём специальный TILT-объект (dict), который
+#    понимает кастомный preprocessor/scheduler внутри vLLM.
 log.info(
     "Starting TILT LLM with model=%s, dtype=%s, tp=%s, max_model_len=%s",
     MODEL_NAME, DTYPE, TP_SIZE, MAX_MODEL_LEN
@@ -45,7 +47,7 @@ log.info(
 llm = LLM(
     model=MODEL_NAME,
     trust_remote_code=True,
-    dtype=DTYPE,                       # torch_dtype is deprecated in newer vLLM
+    dtype=DTYPE,                       # torch_dtype устарел, используем dtype
     tensor_parallel_size=TP_SIZE,
     max_model_len=MAX_MODEL_LEN,
     download_dir=HF_CACHE_DIR,
@@ -124,7 +126,7 @@ def _page_to_tilt(page: InputPage) -> Dict[str, Any]:
     return page_dict
 
 def build_tilt_input(req: TiltRequest) -> Dict[str, Any]:
-    """Builds a single TILT input object compatible with llm.tilt_generate.
+    """Builds a single TILT input object compatible with task='tilt_generate'.
     Top-level keys:
       - 'question': str
       - 'pages': List[ per-page dicts as returned by _page_to_tilt ]
@@ -151,8 +153,11 @@ def tilt_generate(req: TiltRequest = Body(...)) -> Dict[str, Any]:
     # Build TILT input
     tilt_input = build_tilt_input(req)
 
-    # vLLM call (NOTE: use .tilt_generate, not .generate)
-    outputs = llm.tilt_generate(inputs=[tilt_input], sampling_params=sp)
+    # vLLM call: используем обычный .generate(), но с task="tilt_generate"
+    outputs = llm.generate(
+        [tilt_input],
+        sampling_params=sp,
+    )
 
     # Extract first text
     text = ""
@@ -195,7 +200,11 @@ def health() -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 try:
     warmup = {"question": "ping", "pages": []}
-    llm.tilt_generate(inputs=[warmup], sampling_params=SamplingParams(temperature=0.0, max_tokens=8))
-    log.info("Warmup tilt_generate executed.")
+    # Тот же интерфейс, что и в основном endpoint:
+    llm.generate(
+        [warmup],
+        sampling_params=SamplingParams(temperature=0.0, max_tokens=8),
+    )
+    log.info("Warmup generate (tilt task) executed.")
 except Exception as e:
-    log.warning("Warmup tilt_generate failed but continuing startup: %s", e)
+    log.warning("Warmup generate (tilt task) failed but continuing startup: %s", e)
