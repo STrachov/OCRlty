@@ -3,15 +3,19 @@ sitecustomize для Arctic-TILT контейнера.
 
 Цель:
 - если установлена VLLM_SKIP_PROFILE_RUN=1, отключить profile_run()
-  для TILT-моделей в vLLM, чтобы не падать на кривом тестовом прогоне.
+  для энкодер-декодерных моделей в vLLM (в т.ч. TiltModel),
+  чтобы не падать на некорректном тестовом прогоне.
 
-Работает для:
-- старого TILTModelRunner (если появится)
-- EncDecModelRunner с architecture == "TiltModel"
+Подход:
+- пробуем пропатчить TILTModelRunner (если есть),
+- плюс ИЩЕМ в vllm.worker.enc_dec_model_runner любой класс
+  с методом profile_run и execute_model и глушим profile_run
+  вообще (глобально).
 """
 
 import os
 import sys
+import inspect
 
 
 def _patch_vllm_profile_run() -> None:
@@ -19,7 +23,7 @@ def _patch_vllm_profile_run() -> None:
     if flag not in ("1", "true", "True", "yes", "YES"):
         return
 
-    # 1) Патч для потенциального TILTModelRunner (task="tilt_generate")
+    # 1) Патч для потенциального TILTModelRunner (старые варианты vLLM)
     try:
         from vllm.worker import tilt_model_runner as tmr  # type: ignore[import]
     except Exception as exc:  # noqa: BLE001
@@ -27,13 +31,13 @@ def _patch_vllm_profile_run() -> None:
     else:
         runner_cls = getattr(tmr, "TILTModelRunner", None)
         if runner_cls is not None:
-            def _no_profile_cls(self) -> None:  # noqa: ANN001, D401
+            def _no_profile_tilt(self) -> None:  # noqa: ANN001, D401
                 """No-op TILTModelRunner.profile_run()."""
                 sys.stderr.write("sitecustomize: TILTModelRunner.profile_run() skipped\n")
                 return None
 
             try:
-                runner_cls.profile_run = _no_profile_cls  # type: ignore[assignment]
+                runner_cls.profile_run = _no_profile_tilt  # type: ignore[assignment]
                 sys.stderr.write(
                     "sitecustomize: patched TILTModelRunner.profile_run -> no-op\n"
                 )
@@ -44,60 +48,51 @@ def _patch_vllm_profile_run() -> None:
         else:
             sys.stderr.write("sitecustomize: TILTModelRunner not found on tilt_model_runner\n")
 
-    # 2) Патч EncDecModelRunner.profile_run для TiltModel (task='generate' с TiltModel)
+    # 2) Глобальный патч profile_run для энкодер-декодерного раннера
     try:
         from vllm.worker import enc_dec_model_runner as edm  # type: ignore[import]
     except Exception as exc:  # noqa: BLE001
         sys.stderr.write(f"sitecustomize: cannot import vllm.worker.enc_dec_model_runner: {exc}\n")
         return
 
-    encdec_cls = getattr(edm, "EncDecModelRunner", None)
-    if encdec_cls is None:
-        sys.stderr.write(
-            "sitecustomize: EncDecModelRunner not found on enc_dec_model_runner\n"
-        )
-        return
+    candidates = []
 
-    original_profile_run = getattr(encdec_cls, "profile_run", None)
-    if original_profile_run is None:
+    for name, obj in vars(edm).items():
+        if not inspect.isclass(obj):
+            continue
+        if hasattr(obj, "profile_run") and hasattr(obj, "execute_model"):
+            candidates.append((name, obj))
+
+    if not candidates:
         sys.stderr.write(
-            "sitecustomize: EncDecModelRunner.profile_run not found, nothing to patch\n"
+            "sitecustomize: no suitable classes with profile_run/execute_model "
+            "found in enc_dec_model_runner\n"
         )
         return
 
     def _patched_profile_run(self, *args, **kwargs):  # noqa: ANN001, D401
-        """Wrapper над EncDecModelRunner.profile_run для TiltModel.
-
-        Если модель имеет architecture == 'TiltModel', просто пропускаем
-        profile_run, чтобы не падать на некорректных тестовых вводах.
-        Для всех остальных моделей вызываем оригинальную реализацию.
+        """Глобально выключенный profile_run для enc-dec моделей.
+        Для TiltModel это обязательно, иначе падает на forward().
+        Для остальных — просто пропускаем профилирование (ok для нашего случая).
         """
-        arch = None
+        sys.stderr.write(
+            "sitecustomize: EncDec profile_run() skipped (global patch)\n"
+        )
+        return None
+
+    for name, cls in candidates:
         try:
-            model_config = getattr(self, "model_config", None)
-            arch = getattr(model_config, "architecture", None)
-        except Exception:  # noqa: BLE001
-            # Если не смогли достать архитектуру, лучше не ломать поведение.
-            pass
-
-        if arch == "TiltModel":
+            original = getattr(cls, "profile_run", None)
+            if original is None:
+                continue
+            cls.profile_run = _patched_profile_run  # type: ignore[assignment]
             sys.stderr.write(
-                "sitecustomize: EncDecModelRunner.profile_run() skipped for TiltModel\n"
+                f"sitecustomize: patched {name}.profile_run -> no-op\n"
             )
-            return None
-
-        # Для всех прочих моделей работаем как обычно.
-        return original_profile_run(self, *args, **kwargs)
-
-    try:
-        encdec_cls.profile_run = _patched_profile_run  # type: ignore[assignment]
-        sys.stderr.write(
-            "sitecustomize: patched EncDecModelRunner.profile_run for TiltModel\n"
-        )
-    except Exception as exc:  # noqa: BLE001
-        sys.stderr.write(
-            f"sitecustomize: failed to patch EncDecModelRunner.profile_run: {exc}\n"
-        )
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(
+                f"sitecustomize: failed to patch {name}.profile_run: {exc}\n"
+            )
 
 
 try:
