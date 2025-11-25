@@ -7,6 +7,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     # мы хотим всегда xformers
     VLLM_ATTENTION_BACKEND=XFORMERS \
+    VLLM_PLUGINS="" \
+    VLLM_NO_USAGE_STATS=1 \
+    DO_NOT_TRACK=1 \
     # profile_run у TILT отключаем через sitecustomize
     VLLM_SKIP_PROFILE_RUN=1
 
@@ -56,6 +59,8 @@ RUN python3.10 -m venv /opt/venv \
  && /opt/venv/bin/pip install --no-deps \
       https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/vllm-0.8.3-cp310-cp310-linux_x86_64.whl \
       https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/xformers-0.0.29.post2-cp310-cp310-manylinux_2_28_x86_64.whl
+
+RUN /opt/venv/bin/pip uninstall -y paddlex || true
 
 # В рантайме всегда используем /opt/venv/bin/python и видим /opt/app/sitecustomize.py
 ENV PATH=/opt/venv/bin:$PATH \
