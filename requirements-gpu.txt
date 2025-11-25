@@ -19,7 +19,7 @@ pandas>=2.3,<3
 msgspec>=0.18,<0.20
 
 # -------------------- OCR / PDF --------------------
-paddlepaddle-gpu==2.6.1
+paddlepaddle==2.6.1
 paddleocr>=3.3,<4.0
 opencv-contrib-python-headless==4.10.0.84
 pypdfium2>=5.0.0
