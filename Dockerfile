@@ -48,7 +48,7 @@ RUN python3.10 -m venv /opt/venv \
  && /opt/venv/bin/pip install \
       torch==2.6.0 \
       torchvision==0.21.0 \
-      torchaudio==2.6.0 \
+      #torchaudio==2.6.0 \
       --index-url https://download.pytorch.org/whl/cu124 \
  # requirements-gpu.txt: torch 2.6.0+cu124, HF, FastAPI, opencv и прочий стек
  && /opt/venv/bin/pip install -r requirements-gpu.txt \
