@@ -51,7 +51,7 @@ multidict>=6,<7
 yarl>=1.9,<2
 gguf>=0.10,<1.0
 nvidia-ml-py>=12.560.30
-
+prometheus_client>=0.16,<1.0   
 # quality-of-life (обычно используются логгер/сериализация)
 rich>=13,<14
 orjson>=3.10,<4
