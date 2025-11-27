@@ -8,14 +8,13 @@
   - **Сборка:** vLLM **0.8.3** собран отдельно в wheel (CPython 3.10, Linux x86_64), выкладывается в **GitHub Releases**. В прод‑образе этот wheel подтягивается по URL + проверка **SHA256**.
   - **База образа:** CUDA **12.4** (runtime), Python **3.10**, **Torch 2.6.0+cu124**.
   - **Кастомная сборка XFormers.
-  - **Prod на RunPod:** один контейнер, где поднимаем **`tilt_api.py` (:8001)**. (Второй API с OCR на CPU можно добавить позже, но TILT уже работает стабильно отдельно.)
+  - **Prod на RunPod:** один контейнер, где поднимаем **`tilt_api.py` (:8001) и API с OCR на CPU**. 
   - **SHM:** в RunPod оставляем дефолтный **/dev/shm ≈ 24ГБ** (не занижаем, это важно для FA/xformers). 
   - **Отладка старта:** переменная `SLEEP_ON_START=1` переведёт контейнер в режим `tail -f /dev/null`, чтобы подключиться и проверить окружение.
 
 ## 1) Архитектура (минимально‑жизнеспособная для TILT)
   **Один под RunPod → один контейнер → один процесс:**
-  - **`tilt_api.py` (Uvicorn, :8001)** — поднимает vLLM `LLM()` с `task=tilt_generate`, dtype=float16, TP=1; даёт OpenAI‑совместимый endpoint `/v1/chat/completions`.
-
+  - **`tilt_api.py` (Uvicorn, :8001)** — поднимает vLLM `LLM()` в обёртке FastAPI который жаёт OpenAI‑совместимый endpoint.
   > Позже можно добавить второй процесс (FastAPI OCR на :8000) и сделать полноценный pipeline OCR → TILT. Текущая версия документа фокусируется на стабильном запуске **TILT**.
 
 
@@ -27,20 +26,41 @@
   - **vLLM:** 0.8.3 (wheel, собранный из форка Snowflake‑Labs/arctic‑tilt v0.8.3)
   - **HF экосистема:** `huggingface_hub`, `tokenizers`, `sentencepiece` и т.д.
 
-## 3) Колесо vLLM 0.8.3 (форк Arctic‑TILT) — сборка и выкладка
-  - Сборка делалась на выделенной сервере (16 ядер, 64 ГБ RAM, быстрый NVMe). Итоговый wheel ≈ **400–420 МБ**. Процесс сборки подробно описан в файле vllm_wheel_creation.txt
+## 3) Колесо vLLM 0.8.3 (форк Arctic‑TILT) — сборка и выкладка (подробно в файле vllm_wheel_creation.txt)
+  - Сборка делалась на выделенном сервере (16 ядер, 64 ГБ RAM, быстрый NVMe). Итоговый wheel ≈ **400–420 МБ**. Процесс сборки подробно описан в файле vllm_wheel_creation.txt
   - Колесо кладём в **GitHub Releases** своего репозитория (тег `tilt-vllm-cu124-py310-torch26`).
 
-## 4) GitHub Actions — заметки по сборке
-  - Использовать **buildx** и **QEMU** не требуется (linux/amd64).
-  - Чистить диск в CI перед установкой Torch (удаление `pip`‑кэшей, `rm -rf /usr/local/cuda-*/compat/*` не трогаем).
+## 4) Создаем локально колесо XFormers
+  Цель: получить файл xformers-0.0.29.post2-cp310-cp310-manylinux_2_28_x86_64.whl совместимый с: 
+  Python 3.10
+  torch==2.6.0 (CUDA 12.4) 
+  - На Windows: создаём папку под wheel 
+    mkdir D:\xformers-wheel
+    cd D:\xformers-wheel
+  - Запускаем вспомогательный контейнер с Python 3.10
+  docker run --rm -it `
+    -v ${PWD}:/dist-xformers `
+    python:3.10-slim `
+    bash
+  - Внутри контейнера: обновляем pip и качаем xformers-колесо
+    python -m pip install --upgrade pip
+    d /dist-xformers
+    python -m pip download \
+      --no-deps \
+      "xformers==0.0.29.post2" \
+      -d .
+  - Проверяем, что файл нормальный
+  ls -lh
+  - Загружаем вручную колесо в releases рядом с колесом vLLM
+
+## 5) GitHub Actions — заметки по сборке
   - Сохранять артефактом **wheel** vLLM и выкладывать в **Releases** (имя файла без пробелов, полное имя колеса).
   - Здесь впервые задаются:
     IMAGE: ghcr.io/strachov/arctic-tilt:cu124-py310-torch26-v0.8.3
     VLLM_WHL_URL: https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/vllm-0.8.3-cp310-cp310-linux_x86_64.whl
     VLLM_WHL_SHA256
 
-## 5) RunPod — параметры пода
+## 6) RunPod — параметры пода
   **Image:** `ghcr.io/strachov/arctic-tilt:cu124-py310-torch26-v0.8.3`
 
   **Ports:**
@@ -82,25 +102,25 @@
   tail -f /dev/null
   ---
 
-## 6) Dockerfile (prod)
-  - Используем devel-вариант базового образа, иначе xformers не соберётся (pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel)
+## 7) Dockerfile (prod)
+  - Используем базовый образ nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
   - Отдельное venv c "тяжёлыми" вещами, чтобы потом переиспользовать
-  - vLLM-сборка ставится БЕЗ зависимостей (с --no-deps)
-  - Сборка xformers из исходников под именно ЭТУ связку torch/cu124 (используем тот же /opt/venv, тот же python, и nvcc из образа).
-  - Копируем готовое /opt/venv из builder, где уже стоят torch, torchvision, vllm и собранный xformers.wheel
-  - Ставим собранный xformers (строго из нашего wheel, чтобы не подтянуть чужой)
-  - Копируем код приложения и requirements в /opt/app
-  - entrypoint — создаёт /workspace/venv, дотягивает runtime-зависимости и стартует uvicorn
-
-## 7) entrypoint.sh
+  - XFormers и vLLM ставим из наших колес с --no-deps
+  - принудительно удаляем paddlex
+  - В рантайме всегда используем /opt/venv/bin/python 
+  - Копируем код репозитория в /opt/app
+  - /opt/venv/bin и /opt/app должны быть первыми в PATH, чтобы при желании перекрывать версии лёгких пакетов.
+  
+  
+## 8) entrypoint.sh
   - Задаем адреса кэшей и базовые пути
   - Всегда используем персистентный venv на /workspace (RunPod volume)
   - Устанавливаем runtime-зависимости проекта в /workspace/venv
-  - Делаем пакеты из /opt/venv видимыми (torch, torchvision, vllm, xformers)
-  - ВАЖНО: /workspace/venv должен быть первым в PATH, чтобы при желании перекрывать версии лёгких пакетов.
   - Проба окружения: убеждаемся, что ключевые пакеты доступны
+  - Стартуем uvicorn
 
-## 8) Дальше (опционально)
+
+## 9) Дальше (опционально)
   - Добавить второй процесс (FastAPI OCR CPU :8000) и объединить в один контейнер через `scripts/entrypoint.sh` (vLLM → wait → API).
   - Ограничить OCR‑параллелизм семафором, держать один `httpx.AsyncClient` к :8001.
   - Вынести общие конфиги в `configs/default.yaml` и переменные в `.env`.
