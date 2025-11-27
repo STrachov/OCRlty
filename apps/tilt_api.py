@@ -14,15 +14,15 @@ from pydantic import BaseModel, Field
 from PIL import Image  # type: ignore[import]
 
 from vllm import SamplingParams
-from vllm.engine.llm_engine import LLMEngine
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
-from vllm.utils import FlexibleArgumentParser
+from vllm.engine.llm_engine import LLMEngine
 from vllm.multimodal.tilt_processor import (
     Document,
     Page,
     Question,
     TiltPreprocessor,
 )
+from vllm.utils import FlexibleArgumentParser
 
 # -------------------------------------------------------------------------
 # Logging
@@ -70,7 +70,7 @@ log.info(
 app = FastAPI(title="Arctic-TILT API", version="1.0")
 
 # -------------------------------------------------------------------------
-# vLLM Engine + TiltPreprocessor (через CLI, как в example_tilt.py)
+# vLLM Engine + TiltPreprocessor (через CLI, как в tilt_example.py)
 # -------------------------------------------------------------------------
 
 
@@ -80,7 +80,7 @@ def _build_llm_engine() -> Tuple[LLMEngine, TiltPreprocessor]:
         description="Arctic-TILT vLLM engine (used behind FastAPI)."
     )
 
-    # Добавляем стандартные engine-аргументы vLLM
+    # Добавляем стандартные engine-аргументы vLLM (0.8.3)
     parser = AsyncEngineArgs.add_cli_args(parser, async_args_only=False)
 
     # Значения по умолчанию для TILT (по мотивам examples/tilt_example.py)
@@ -96,7 +96,7 @@ def _build_llm_engine() -> Tuple[LLMEngine, TiltPreprocessor]:
         disable_log_requests=True,
     )
 
-    # Мы не читаем реальные CLI-аргументы, а используем только дефолты+ENV
+    # Не читаем реальные CLI-аргументы, используем только дефолты+ENV
     args = parser.parse_args([])
 
     # Донастраиваем из ENV
@@ -130,7 +130,7 @@ llm_engine, preprocessor = _build_llm_engine()
 _engine_lock = threading.Lock()
 
 # -------------------------------------------------------------------------
-# Pydantic models: low-level TILT request (internal API)
+# Pydantic models: TILT request
 # -------------------------------------------------------------------------
 
 
@@ -154,7 +154,7 @@ class OCRPage(BaseModel):
 
 
 class InputPage(BaseModel):
-    # В реальных запросах ожидаем, что OCR заполнен.
+    # OCR — основной источник данных (Paddle и т.п.)
     ocr: Optional[OCRPage] = Field(
         None, description="OCR result with word boxes in pixels"
     )
@@ -234,8 +234,16 @@ def _input_page_to_tilt_page(page: InputPage) -> Page:
     )
 
 
-def _run_tilt_inference(req: TiltRequest) -> str:
-    """Выполнить один запрос TILT через LLMEngine, синхронно."""
+# -------------------------------------------------------------------------
+# Core: один TILT-запрос через LLMEngine (с дебагом)
+# -------------------------------------------------------------------------
+
+
+def _run_tilt_inference(req: TiltRequest) -> Tuple[str, Optional[str]]:
+    """
+    Выполнить один запрос TILT через LLMEngine, синхронно.
+    Возвращает (text, debug_repr).
+    """
 
     if not req.pages:
         raise HTTPException(status_code=400, detail="Request must contain at least one page.")
@@ -247,10 +255,17 @@ def _run_tilt_inference(req: TiltRequest) -> str:
     document = Document(ident=doc_id, split=None, pages=tilt_pages)
     questions = [Question(feature_name="answer", text=req.question)]
 
+    log.debug(
+        "Preprocessor input: doc_id=%s, pages=%d, question=%s",
+        doc_id,
+        len(tilt_pages),
+        req.question,
+    )
+
     samples = preprocessor.preprocess(document, questions)
     if not samples:
         log.warning("Preprocessor returned no samples; returning empty answer.")
-        return ""
+        return "", None
 
     sample = samples[0]
 
@@ -278,6 +293,9 @@ def _run_tilt_inference(req: TiltRequest) -> str:
         # Как в tilt_example: крутим step() пока наша заявка не закончится
         while True:
             request_outputs = llm_engine.step()
+            if not request_outputs:
+                # Теоретически может быть, если ещё ничего не готово
+                continue
             for output in request_outputs:
                 if output.request_id == request_id and output.finished:
                     final_output = output
@@ -287,21 +305,29 @@ def _run_tilt_inference(req: TiltRequest) -> str:
 
     if final_output is None:
         log.warning("No RequestOutput from LLMEngine for request_id=%s", request_id)
-        return ""
+        return "", None
 
     outputs = getattr(final_output, "outputs", None) or []
     if not outputs:
         log.warning("RequestOutput.outputs is empty for request_id=%s", request_id)
-        return ""
+        return "", repr(final_output)
+
+    first = outputs[0]
+    debug_repr = repr(first)
 
     try:
-        text = outputs[0].text
-        if not isinstance(text, str):
-            text = str(text)
-        return text.strip()
+        text = first.text
     except Exception as exc:  # noqa: BLE001
         log.warning("Failed to extract text from outputs[0]: %s", exc)
-        return ""
+        return "", debug_repr
+
+    if not isinstance(text, str):
+        text = str(text)
+
+    text = text.strip()
+    log.info("TILT output text=%r", text)
+
+    return text, debug_repr
 
 
 # -------------------------------------------------------------------------
@@ -315,7 +341,7 @@ def tilt_generate(req: TiltRequest = Body(...)) -> Dict[str, Any]:
     Низкоуровневый endpoint: напрямую принимает TiltRequest
     (question + pages[ocr/image]) и возвращает OpenAI-like ответ.
     """
-    text = _run_tilt_inference(req)
+    text, debug_repr = _run_tilt_inference(req)
 
     return {
         "id": "tiltcmpl-1",
@@ -333,13 +359,20 @@ def tilt_generate(req: TiltRequest = Body(...)) -> Dict[str, Any]:
             "completion_tokens": None,
             "total_tokens": None,
         },
-        "raw": None,
+        # Для дебага: repr первого completion; если совсем пусто —
+        # будет None или repr(final_output).
+        "raw": {"output_repr": debug_repr} if debug_repr is not None else None,
     }
 
 
 @app.get("/v1/health")
 def health() -> Dict[str, Any]:
-    return {"status": "ok", "model": MODEL_NAME}
+    return {
+        "status": "ok",
+        "model": MODEL_NAME,
+        "dtype": DTYPE,
+        "gpu_util": GPU_UTIL,
+    }
 
 
 # -------------------------------------------------------------------------
