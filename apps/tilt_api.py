@@ -6,141 +6,122 @@ import io
 import logging
 import os
 import threading
-import time
-from typing import Any, Dict, List, Optional
+import itertools
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI
 from pydantic import BaseModel, Field
-from PIL import Image  # type: ignore[import]
 
-from vllm import SamplingParams
-from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
-from vllm.engine.llm_engine import LLMEngine
+from PIL import Image
+
+from vllm import LLMEngine, SamplingParams
+from vllm.engine.arg_utils import EngineArgs
 from vllm.multimodal.tilt_processor import (
     Document,
     Page,
     Question,
     TiltPreprocessor,
 )
-from vllm.utils import FlexibleArgumentParser
+from vllm.outputs import RequestOutput
+
 
 # -------------------------------------------------------------------------
 # Logging
 # -------------------------------------------------------------------------
-
 log = logging.getLogger("tilt_api")
-if not log.handlers:
-    logging.basicConfig(
-        level=os.getenv("LOGLEVEL", "INFO"),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"))
+
 
 # -------------------------------------------------------------------------
-# Config from ENV
+# Config (ENV)
 # -------------------------------------------------------------------------
-
 MODEL_NAME: str = os.getenv("TILT_MODEL", "Snowflake/snowflake-arctic-tilt-v1.3")
-DTYPE: str = os.getenv("TILT_DTYPE", "float16")  # "float16" | "bfloat16"
-TP_SIZE: int = int(os.getenv("TILT_TP", os.getenv("VLLM_TP_SIZE", "1")))
-MAX_MODEL_LEN_ENV: Optional[str] = os.getenv("TILT_MAX_LEN", None)
 
-GPU_UTIL: float = float(os.getenv("VLLM_GPU_UTIL", os.getenv("GPU_UTIL", "0.90")))
+# В официальном примере по умолчанию bfloat16, но оставим возможность
+# переопределить через ENV.
+DTYPE: str = os.getenv("TILT_DTYPE", "bfloat16")  # "float16" или "bfloat16"
+
+TP_SIZE: int = int(os.getenv("TILT_TP", "1"))
+
+# В примере для TILT Long используют очень длинный контекст (125000).
+MAX_MODEL_LEN: int = int(os.getenv("TILT_MAX_LEN", "125000"))
+
+GPU_UTIL: float = float(os.getenv("VLLM_GPU_UTIL",
+                                  os.getenv("GPU_UTIL", "0.90")))
 HF_CACHE_DIR: str = os.getenv("HF_HOME", "/workspace/cache/hf")
-ENFORCE_EAGER: bool = os.getenv("VLLM_ENFORCE_EAGER", "1").lower() in (
+ENFORCE_EAGER: bool = os.getenv("VLLM_ENFORCE_EAGER", "1") in (
     "1",
     "true",
-    "yes",
-)
-
-DEFAULT_TEMPERATURE: float = float(os.getenv("TILT_TEMPERATURE", "0.0"))
-DEFAULT_MAX_TOKENS: int = int(os.getenv("TILT_MAX_TOKENS", "256"))
-
-log.info(
-    "TILT config: model=%s, dtype=%s, tp=%s, gpu_util=%s",
-    MODEL_NAME,
-    DTYPE,
-    TP_SIZE,
-    GPU_UTIL,
+    "True",
 )
 
 # -------------------------------------------------------------------------
 # FastAPI app
 # -------------------------------------------------------------------------
-
 app = FastAPI(title="Arctic-TILT API", version="1.0")
 
 # -------------------------------------------------------------------------
-# vLLM Engine + TiltPreprocessor (как в official tilt_example.py)
+# vLLM Engine + TiltPreprocessor
 # -------------------------------------------------------------------------
 
+# EngineArgs максимально близко к example_tilt.py
+engine_args = EngineArgs(
+    model=MODEL_NAME,
+    task="tilt_generate",
+    dtype=DTYPE,
+    tensor_parallel_size=TP_SIZE,
+    download_dir=HF_CACHE_DIR,
+    gpu_memory_utilization=GPU_UTIL,
+    enforce_eager=ENFORCE_EAGER,
+    max_model_len=MAX_MODEL_LEN,
+    # Критично: TILT-шедулер
+    scheduler_cls="vllm.tilt.scheduler.Scheduler",
+    # Как в примере:
+    disable_async_output_proc=True,  # Not implemented in TILT scheduler
+    disable_log_requests=True,
+)
 
-def _build_llm_engine() -> tuple[LLMEngine, TiltPreprocessor]:
-    """Create LLMEngine and TiltPreprocessor configured for TILT."""
-    parser = FlexibleArgumentParser(
-        description="Arctic-TILT vLLM engine (used behind FastAPI)."
-    )
+log.info(
+    "TILT config: model=%s, dtype=%s, tp=%s, gpu_util=%.2f, max_model_len=%s",
+    MODEL_NAME,
+    DTYPE,
+    TP_SIZE,
+    GPU_UTIL,
+    MAX_MODEL_LEN,
+)
 
-    # Добавляем стандартные engine-аргументы vLLM
-    parser = AsyncEngineArgs.add_cli_args(parser, async_args_only=False)
+log.info("Creating LLMEngine with task=tilt_generate")
+llm_engine = LLMEngine.from_engine_args(engine_args)
 
-    # Значения по умолчанию для TILT (по мотивам examples/tilt_example.py)
-    parser.set_defaults(
-        model=MODEL_NAME,
-        task="tilt_generate",
-        scheduler_cls="vllm.tilt.scheduler.Scheduler",
-        gpu_memory_utilization=GPU_UTIL,
-        dtype=DTYPE,
-        max_num_seqs=16,
-        enforce_eager=ENFORCE_EAGER,
-        disable_async_output_proc=True,  # Not implemented in TILT scheduler
-        disable_log_requests=True,
-    )
+# Инициализируем препроцессор TILT (строго как в примере)
+tokenizer = llm_engine.get_tokenizer()
+preprocessor = TiltPreprocessor.from_config(
+    model_config=llm_engine.model_config.hf_config,
+    tokenizer=tokenizer.backend_tokenizer,
+)
 
-    # Мы не читаем реальные CLI-аргументы, а используем только дефолты+ENV
-    args = parser.parse_args([])
+# Стриминговый LLMEngine не тред-сейф → оборачиваем в lock
+_llm_lock = threading.Lock()
+_request_counter = itertools.count()
 
-    # Донастраиваем из ENV
-    args.tensor_parallel_size = TP_SIZE
-    args.download_dir = HF_CACHE_DIR
+# Дефолтные SamplingParams
+DEFAULT_SP = SamplingParams(
+    temperature=float(os.getenv("TILT_TEMPERATURE", "0.0")),
+    max_tokens=int(os.getenv("TILT_MAX_TOKENS", "64")),
+    logprobs=0,
+)
 
-    if MAX_MODEL_LEN_ENV:
-        try:
-            args.max_model_len = int(MAX_MODEL_LEN_ENV)
-        except ValueError:
-            log.warning(
-                "Invalid TILT_MAX_LEN=%s, ignoring and using default.",
-                MAX_MODEL_LEN_ENV,
-            )
-
-    engine_args = EngineArgs.from_cli_args(args)
-    log.info("Creating LLMEngine with task=%s", engine_args.task)
-
-    llm_engine = LLMEngine.from_engine_args(engine_args)
-
-    tokenizer = llm_engine.get_tokenizer()
-    preprocessor = TiltPreprocessor.from_config(
-        model_config=llm_engine.model_config.hf_config,
-        tokenizer=tokenizer.backend_tokenizer,
-    )
-
-    return llm_engine, preprocessor
-
-
-llm_engine, preprocessor = _build_llm_engine()
-_engine_lock = threading.Lock()
 
 # -------------------------------------------------------------------------
-# Pydantic models: low-level TILT request (internal API)
+# Pydantic Schemas (входной контракт API)
 # -------------------------------------------------------------------------
-
-
 class OCRWord(BaseModel):
     text: str = Field(..., description="Recognized token text")
     bbox: List[float] = Field(
         ...,
         min_items=4,
         max_items=4,
-        description="[x0,y0,x1,y1] in pixels",
+        description="[x0,y0,x1,y1] in pixels (absolute)",
     )
 
 
@@ -149,100 +130,103 @@ class OCRPage(BaseModel):
     height: int = Field(..., description="Page height in pixels")
     words: List[OCRWord] = Field(
         default_factory=list,
-        description="Words with absolute bboxes",
+        description="Words with absolute bboxes in pixels",
     )
 
 
 class InputPage(BaseModel):
-    # В реальных запросах ожидаем, что OCR заполнен.
-    ocr: Optional[OCRPage] = Field(
-        None, description="OCR result with word boxes in pixels"
-    )
-    # Картинка опциональна — для визуальных признаков.
+    # Можно передавать:
+    #  - только OCR (width/height/words/bboxes)
+    #  - OCR + картинку (image_b64 или image_path)
     image_b64: Optional[str] = Field(
-        None, description="Base64-encoded PNG/JPG of the page"
+        None, description="Base64-encoded PNG/JPG of the page (optional)"
     )
     image_path: Optional[str] = Field(
-        None, description="Filesystem path to page image (mounted into container)"
+        None,
+        description="Filesystem path to page image mounted into container (optional)",
+    )
+    ocr: Optional[OCRPage] = Field(
+        None, description="OCR result with word boxes in pixels"
     )
 
 
 class TiltRequest(BaseModel):
-    question: str = Field(..., description="Doc-VQA / KIE question or instruction")
+    question: str = Field(
+        ..., description="Doc-VQA / KIE question or instruction"
+    )
     pages: List[InputPage] = Field(
         ..., description="List of page images and/or OCR data"
     )
+
+    # Опциональные поля
     model: Optional[str] = Field(
-        None, description="Override model name (optional)"
+        None, description="Override model name (optional, обычно не нужно)"
     )
     temperature: Optional[float] = Field(
-        None, description="Overrides default temperature"
+        None, description="Override default temperature"
     )
     max_tokens: Optional[int] = Field(
-        None, description="Overrides default max tokens"
+        None, description="Override default max_tokens"
+    )
+    doc_id: Optional[str] = Field(
+        None, description="Optional document identifier for debugging/logging"
     )
 
 
 # -------------------------------------------------------------------------
-# Pydantic models: OpenAI-like /v1/chat/completions (high-level API)
+# Helpers: конвертация JSON → Document/Page/Question
 # -------------------------------------------------------------------------
-
-
-class ChatCompletionRequest(BaseModel):
-    model: Optional[str] = Field(
-        None,
-        description="Model name (ignored for now; TILT is fixed).",
-    )
-    messages: List[Dict[str, Any]] = Field(
-        ..., description="OpenAI-like chat messages."
-    )
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-
-
-# -------------------------------------------------------------------------
-# Helpers: InputPage -> TILT Document/Page
-# -------------------------------------------------------------------------
-
-
-def _decode_image(page: InputPage) -> Image.Image:
-    """Получаем PIL.Image из image_b64 или image_path, либо создаём заглушку."""
+def _decode_image_from_page(page: InputPage) -> Image.Image:
+    """
+    Получить PIL.Image для страницы:
+      - если есть image_b64 → декодируем;
+      - если есть image_path → открываем файл;
+      - если ничего нет → создаём белый dummy image по размеру OCR (или 768x1086).
+    """
+    # 1) image_b64
     if page.image_b64:
         try:
-            raw = base64.b64decode(page.image_b64)
-            return Image.open(io.BytesIO(raw)).convert("RGB")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Failed to decode image_b64: %s", exc)
+            raw = base64.b64decode(page.image_b64, validate=False)
+            return Image.open(io.BytesIO(raw)).convert("L")
+        except Exception as e:  # noqa: BLE001
+            log.warning("Failed to decode image_b64: %s", e)
 
+    # 2) image_path
     if page.image_path:
         try:
-            return Image.open(page.image_path).convert("RGB")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Failed to open image_path=%s: %s", page.image_path, exc)
+            img = Image.open(page.image_path)
+            return img.convert("L")
+        except Exception as e:  # noqa: BLE001
+            log.warning("Failed to open image_path %s: %s", page.image_path, e)
 
-    # Заглушка: белый лист A4
-    return Image.new(mode="L", size=(768, 1086), color=255)
-
-
-def _input_page_to_tilt_page(page: InputPage) -> Page:
-    img = _decode_image(page)
-
+    # 3) dummy по размеру OCR или дефолт
+    width = 768
+    height = 1086
     if page.ocr:
-        width = page.ocr.width
-        height = page.ocr.height
+        width = max(int(page.ocr.width), 1)
+        height = max(int(page.ocr.height), 1)
+
+    return Image.new(mode="L", size=(width, height), color=255)
+
+
+def _page_to_tilt_page(page: InputPage) -> Page:
+    """
+    Конвертирует InputPage в vLLM Page, как это делает Loader в tilt_example.py.
+    """
+    if page.ocr:
+        width = int(page.ocr.width)
+        height = int(page.ocr.height)
         words = [w.text for w in page.ocr.words]
-        # Безопасно приводим bbox к int
-        bboxes = []
-        for w in page.ocr.words:
-            try:
-                bboxes.append([int(round(v)) for v in w.bbox])
-            except Exception:
-                # если вдруг мусор — просто пропускаем
-                continue
+        # В примере bboxes берутся как есть из tokens_layer["positions"].
+        bboxes = [list(map(float, w.bbox)) for w in page.ocr.words]
     else:
+        # Без OCR у нас нет токенов, но картинку/заглушку всё равно передадим.
+        img = _decode_image_from_page(page)
         width, height = img.size
         words = []
         bboxes = []
+
+    img = _decode_image_from_page(page)
 
     return Page(
         words=words,
@@ -253,211 +237,110 @@ def _input_page_to_tilt_page(page: InputPage) -> Page:
     )
 
 
-def _run_tilt_inference(req: TiltRequest) -> str:
-    """Выполнить один запрос TILT через LLMEngine, синхронно."""
+def build_document_and_questions(
+    req: TiltRequest,
+) -> Tuple[Document, List[Question]]:
+    """
+    Строим Document + список Questions по входящему TiltRequest.
+    """
+    pages: List[Page] = []
+    for p in req.pages:
+        pages.append(_page_to_tilt_page(p))
 
-    if not req.pages:
-        raise HTTPException(status_code=400, detail="Request must contain at least one page.")
+    doc_ident = req.doc_id or "user-doc-1"
+    document = Document(ident=doc_ident, split=None, pages=pages)
 
-    # Собираем Document и Question
-    doc_id = f"api-{int(time.time() * 1000)}"
-    tilt_pages = [_input_page_to_tilt_page(p) for p in req.pages]
+    # Для TILT question.feature_name использовали как "ключ поля",
+    # а text — как текст вопроса. Нам важен только текст.
+    questions: List[Question] = [
+        Question(feature_name="user_question", text=req.question)
+    ]
 
-    document = Document(ident=doc_id, split=None, pages=tilt_pages)
-    questions = [Question(feature_name="answer", text=req.question)]
+    return document, questions
 
-    samples = preprocessor.preprocess(document, questions)
-    if not samples:
-        log.warning("Preprocessor returned no samples; returning empty answer.")
-        return ""
 
-    sample = samples[0]
+# -------------------------------------------------------------------------
+# Небольшой helper: выполнить один sample через LLMEngine
+# -------------------------------------------------------------------------
+def _run_single_sample(sample: Any, sp: SamplingParams) -> RequestOutput:
+    """
+    Запускает один sample через LLMEngine (add_request + step),
+    блокируя общий движок через _llm_lock.
+    """
+    request_id = str(next(_request_counter))
 
-    # Sampling params (с учётом оверрайдов)
-    temperature = req.temperature if req.temperature is not None else DEFAULT_TEMPERATURE
-    max_tokens = req.max_tokens if req.max_tokens is not None else DEFAULT_MAX_TOKENS
-
-    sampling_params = SamplingParams(
-        temperature=temperature,
-        max_tokens=max_tokens,
-        logprobs=0,
-    )
-
-    request_id = f"{doc_id}-q0"
-    final_output = None
-
-    # Сериализуем доступ к движку
-    with _engine_lock:
+    with _llm_lock:
         llm_engine.add_request(
             prompt=sample,
             request_id=request_id,
-            params=sampling_params,
+            params=sp,
         )
 
-        # Как в tilt_example: крутим step() пока наша заявка не закончится
+        final_output: Optional[RequestOutput] = None
+
         while True:
             request_outputs = llm_engine.step()
-            for output in request_outputs:
-                if output.request_id == request_id and output.finished:
-                    final_output = output
+            for out in request_outputs:
+                if out.request_id == request_id and out.finished:
+                    final_output = out
                     break
             if final_output is not None:
                 break
 
-    if final_output is None or not final_output.outputs:
-        log.warning("No output from LLMEngine for request_id=%s", request_id)
-        return ""
+    if final_output is None:
+        raise RuntimeError("LLMEngine.step() ended without a finished output")
 
-    return final_output.outputs[0].text
-
-
-# -------------------------------------------------------------------------
-# Helpers: OpenAI-like chat request -> TiltRequest
-# -------------------------------------------------------------------------
-
-
-def _tilt_request_from_chat(req: ChatCompletionRequest) -> TiltRequest:
-    """
-    Простейший маппинг OpenAI-like /v1/chat/completions запроса в TiltRequest.
-
-    Ожидаемый паттерн (можно использовать и другие, если структура похожа):
-
-    {
-      "model": "...",
-      "messages": [
-        {
-          "role": "user",
-          "content": [
-            {
-              "type": "input_ocr_document",
-              "ocr_document": {
-                "pages": [
-                  {
-                    "width": 1000,
-                    "height": 1500,
-                    "spans": [{"bbox": [..], "text": "..."}]
-                  }
-                ]
-              }
-            },
-            {"type": "text", "text": "Вопрос / инструкция для TILT"}
-          ]
-        }
-      ]
-    }
-    """
-
-    ocr_document: Optional[Dict[str, Any]] = None
-    text_chunks: List[str] = []
-
-    for msg in req.messages:
-        content = msg.get("content")
-
-        if isinstance(content, str):
-            text_chunks.append(content)
-            continue
-
-        if isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                p_type = part.get("type")
-                if p_type == "input_ocr_document":
-                    ocr_document = (
-                        part.get("ocr_document")
-                        or part.get("document")
-                        or ocr_document
-                    )
-                elif p_type in ("text", "input_text"):
-                    txt = part.get("text")
-                    if isinstance(txt, str):
-                        text_chunks.append(txt)
-
-    if ocr_document is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No OCR document found in messages "
-            "(expected a part with type='input_ocr_document').",
-        )
-
-    question = "\n".join(text_chunks).strip()
-    if not question:
-        # если вообще не было текстовых сообщений — всё равно что-то дадим модели
-        question = "Answer the question about the provided document."
-
-    # Преобразуем ocr_document → List[InputPage]
-    pages_in: List[InputPage] = []
-
-    pages_raw = ocr_document.get("pages", [])
-    if not isinstance(pages_raw, list) or not pages_raw:
-        raise HTTPException(
-            status_code=400,
-            detail="OCR document must contain non-empty 'pages' list.",
-        )
-
-    for page_raw in pages_raw:
-        if not isinstance(page_raw, dict):
-            continue
-        width = int(page_raw.get("width", 0))
-        height = int(page_raw.get("height", 0))
-        spans = page_raw.get("spans", []) or page_raw.get("words", [])
-
-        words: List[OCRWord] = []
-        for span in spans:
-            if not isinstance(span, dict):
-                continue
-            text = span.get("text")
-            bbox = span.get("bbox")
-            if not isinstance(text, str) or not isinstance(bbox, list):
-                continue
-            if len(bbox) != 4:
-                continue
-            try:
-                bbox_floats = [float(v) for v in bbox]
-            except Exception:
-                continue
-            words.append(OCRWord(text=text, bbox=bbox_floats))
-
-        if width <= 0 or height <= 0:
-            # если размеры не заданы, попытаемся взять их из bbox-ов
-            if words:
-                xs = [w.bbox[0] for w in words] + [w.bbox[2] for w in words]
-                ys = [w.bbox[1] for w in words] + [w.bbox[3] for w in words]
-                width = int(max(xs) - min(xs)) or 1000
-                height = int(max(ys) - min(ys)) or 1400
-            else:
-                width, height = 1000, 1400
-
-        ocr_page = OCRPage(width=width, height=height, words=words)
-        pages_in.append(InputPage(ocr=ocr_page))
-
-    if not pages_in:
-        raise HTTPException(
-            status_code=400,
-            detail="No valid pages found in OCR document.",
-        )
-
-    return TiltRequest(
-        question=question,
-        pages=pages_in,
-        model=req.model,
-        temperature=req.temperature,
-        max_tokens=req.max_tokens,
-    )
+    return final_output
 
 
 # -------------------------------------------------------------------------
-# API endpoints
+# API
 # -------------------------------------------------------------------------
-
-
 @app.post("/v1/tilt/generate")
 def tilt_generate(req: TiltRequest = Body(...)) -> Dict[str, Any]:
-    """
-    Низкоуровневый endpoint: напрямую принимает TiltRequest
-    (question + pages[ocr/image]) и возвращает OpenAI-like ответ.
-    """
-    text = _run_tilt_inference(req)
+    # 1) Сформировать SamplingParams с учётом оверрайдов
+    sp = DEFAULT_SP
+    if req.temperature is not None or req.max_tokens is not None:
+        sp = SamplingParams(
+            temperature=(
+                req.temperature if req.temperature is not None else DEFAULT_SP.temperature
+            ),
+            max_tokens=(
+                req.max_tokens if req.max_tokens is not None else DEFAULT_SP.max_tokens
+            ),
+            logprobs=DEFAULT_SP.logprobs,
+        )
+
+    # 2) Собрать Document + Questions и прогнать через TiltPreprocessor
+    document, questions = build_document_and_questions(req)
+    log.debug("Built Document ident=%s with %d pages", document.ident, len(document.pages))
+
+    samples = preprocessor.preprocess(document, questions)
+    if not samples:
+        log.warning("TiltPreprocessor returned no samples for document %s", document.ident)
+        text = ""
+        final_output: Optional[RequestOutput] = None
+    else:
+        sample = samples[0]
+        # 3) Прогоняем sample через LLMEngine (как в example_tilt, только синхронно)
+        final_output = _run_single_sample(sample, sp)
+
+        # 4) Достаём текст так же, как _transform_output в примере
+        text = ""
+        try:
+            if final_output.outputs:
+                text = final_output.outputs[0].text
+        except Exception as e:  # noqa: BLE001
+            log.warning("Failed to extract text from RequestOutput: %s", e)
+            text = ""
+
+    # 5) Оборачиваем в OpenAI-подобный ответ
+    raw_dict: Optional[Dict[str, Any]] = None
+    if final_output is not None and final_output.outputs:
+        try:
+            raw_dict = final_output.outputs[0].__dict__
+        except Exception:  # noqa: BLE001
+            raw_dict = None
 
     return {
         "id": "tiltcmpl-1",
@@ -475,38 +358,41 @@ def tilt_generate(req: TiltRequest = Body(...)) -> Dict[str, Any]:
             "completion_tokens": None,
             "total_tokens": None,
         },
-        "raw": None,
-    }
-
-
-@app.post("/v1/chat/completions")
-def chat_completions(req: ChatCompletionRequest = Body(...)) -> Dict[str, Any]:
-    """
-    OpenAI-like endpoint, который ожидает messages с частью type='input_ocr_document'.
-    """
-    tilt_req = _tilt_request_from_chat(req)
-    text = _run_tilt_inference(tilt_req)
-
-    return {
-        "id": "chatcmpl-1",
-        "object": "chat.completion",
-        "model": tilt_req.model or MODEL_NAME,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": None,
-            "completion_tokens": None,
-            "total_tokens": None,
-        },
-        "raw": None,
+        "raw": raw_dict,
     }
 
 
 @app.get("/v1/health")
 def health() -> Dict[str, Any]:
-    return {"status": "ok", "model": MODEL_NAME}
+    return {
+        "status": "ok",
+        "model": MODEL_NAME,
+        "dtype": DTYPE,
+        "max_model_len": MAX_MODEL_LEN,
+    }
+
+
+# -------------------------------------------------------------------------
+# Опциональный warmup (микро-запрос через полный пайплайн)
+# -------------------------------------------------------------------------
+try:
+    dummy_req = TiltRequest(
+        question="ping",
+        pages=[
+            InputPage(
+                ocr=OCRPage(width=768, height=1086, words=[]),
+            )
+        ],
+    )
+    dummy_doc, dummy_questions = build_document_and_questions(dummy_req)
+    dummy_samples = preprocessor.preprocess(dummy_doc, dummy_questions)
+    if dummy_samples:
+        _ = _run_single_sample(
+            dummy_samples[0],
+            SamplingParams(temperature=0.0, max_tokens=8, logprobs=0),
+        )
+        log.info("Warmup for TILT completed successfully.")
+    else:
+        log.warning("Warmup: preprocessor produced no samples, skipped.")
+except Exception as e:  # noqa: BLE001
+    log.warning("Warmup failed (non-fatal): %s", e)
