@@ -372,6 +372,7 @@ def tilt_generate(req: TiltRequest = Body(...)) -> Dict[str, Any]:
     Основной endpoint: принимает question + pages[ocr/image] и возвращает
     OpenAI-подобный ответ с полем raw.output_repr для дебага.
     """
+    print("Welcome!")
     try:
         text, debug_repr = _run_tilt_inference(req)
     except HTTPException:
