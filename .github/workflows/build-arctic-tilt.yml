@@ -4,6 +4,12 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
+    paths:
+      - Dockerfile
+      - requirements-gpu.txt
+      - entrypoint.sh
+      - .github/workflows/build-arctic-tilt.yml
+      - sitecustomize.py
 
 permissions:
   contents: read
