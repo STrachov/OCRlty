@@ -1,394 +1,301 @@
-# apps/tilt_api.py
-from __future__ import annotations
+"""
+FastAPI server for Arctic-TILT on vLLM.
 
-import base64
-import io
+Key design goals:
+- Follow the official examples/tilt_example.py logic for building EngineArgs,
+  TiltPreprocessor and for calling LLMEngine.add_request/step.
+- Accept OCR-only inputs (no image required). When no image is provided, we use
+  a dummy white image with the given page size so TiltPreprocessor is happy.
+- Keep the API small and simple: a single /v1/tilt/generate endpoint.
+"""
+
 import logging
 import os
-import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from PIL import Image  # type: ignore[import]
 
-from vllm import SamplingParams
+from PIL import Image
+
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.engine.llm_engine import LLMEngine
+from vllm.sampling_params import SamplingParams
+from vllm.utils import FlexibleArgumentParser
+
 from vllm.multimodal.tilt_processor import (
     Document,
     Page,
     Question,
     TiltPreprocessor,
 )
-from vllm.utils import FlexibleArgumentParser
 
-# -------------------------------------------------------------------------
-# Logging
-# -------------------------------------------------------------------------
-
-log = logging.getLogger("tilt_api")
-if not log.handlers:
-    logging.basicConfig(
-        level=os.getenv("LOGLEVEL", "INFO"),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
-# -------------------------------------------------------------------------
-# Config from ENV
-# -------------------------------------------------------------------------
-
-MODEL_NAME: str = os.getenv("TILT_MODEL", "Snowflake/snowflake-arctic-tilt-v1.3")
-DTYPE: str = os.getenv("TILT_DTYPE", "float16")  # "float16" | "bfloat16"
-TP_SIZE: int = int(os.getenv("TILT_TP", os.getenv("VLLM_TP_SIZE", "1")))
-MAX_MODEL_LEN_ENV: Optional[str] = os.getenv("TILT_MAX_LEN", None)
-
-GPU_UTIL: float = float(os.getenv("VLLM_GPU_UTIL", os.getenv("GPU_UTIL", "0.90")))
-HF_CACHE_DIR: str = os.getenv("HF_HOME", "/workspace/cache/hf")
-ENFORCE_EAGER: bool = os.getenv("VLLM_ENFORCE_EAGER", "1").lower() in (
-    "1",
-    "true",
-    "yes",
-)
-
-DEFAULT_TEMPERATURE: float = float(os.getenv("TILT_TEMPERATURE", "0.0"))
-DEFAULT_MAX_TOKENS: int = int(os.getenv("TILT_MAX_TOKENS", "256"))
-
-log.info(
-    "TILT config: model=%s, dtype=%s, tp=%s, gpu_util=%s",
-    MODEL_NAME,
-    DTYPE,
-    TP_SIZE,
-    GPU_UTIL,
-)
-
-# -------------------------------------------------------------------------
-# FastAPI app
-# -------------------------------------------------------------------------
-
-app = FastAPI(title="Arctic-TILT API", version="1.0")
-
-# -------------------------------------------------------------------------
-# vLLM Engine + TiltPreprocessor (через CLI, как в tilt_example.py)
-# -------------------------------------------------------------------------
+logger = logging.getLogger("tilt_api")
+logging.basicConfig(level=logging.INFO)
 
 
-def _build_llm_engine() -> Tuple[LLMEngine, TiltPreprocessor]:
-    """Create LLMEngine and TiltPreprocessor configured for TILT."""
-    parser = FlexibleArgumentParser(
-        description="Arctic-TILT vLLM engine (used behind FastAPI)."
-    )
+# ---------------------------------------------------------------------------
+# Configuration via env vars (with safe defaults)
+# ---------------------------------------------------------------------------
 
-    # Добавляем стандартные engine-аргументы vLLM (0.8.3)
-    parser = AsyncEngineArgs.add_cli_args(parser, async_args_only=False)
+MODEL_NAME = os.getenv("TILT_MODEL", "Snowflake/snowflake-arctic-tilt-v1.3")
 
-    # Значения по умолчанию для TILT (по мотивам examples/tilt_example.py)
-    parser.set_defaults(
-        model=MODEL_NAME,
-        task="tilt_generate",
-        scheduler_cls="vllm.tilt.scheduler.Scheduler",
-        gpu_memory_utilization=GPU_UTIL,
-        dtype=DTYPE,
-        max_num_seqs=16,
-        enforce_eager=ENFORCE_EAGER,
-        disable_async_output_proc=True,  # Not implemented in TILT scheduler
-        disable_log_requests=True,
-    )
+# Snowflake's example uses bfloat16; using float16 leads to numerical issues (NaNs)
+# on long contexts with this model. Keep bf16 unless you REALLY need otherwise.
+DTYPE = os.getenv("TILT_DTYPE", "bfloat16")
 
-    # Не читаем реальные CLI-аргументы, используем только дефолты+ENV
-    args = parser.parse_args([])
+TP_SIZE = int(os.getenv("TILT_TP_SIZE", "1"))
 
-    # Донастраиваем из ENV
-    args.tensor_parallel_size = TP_SIZE
-    args.download_dir = HF_CACHE_DIR
+GPU_UTIL = float(os.getenv("TILT_GPU_UTIL", "0.9"))
 
-    if MAX_MODEL_LEN_ENV:
-        try:
-            args.max_model_len = int(MAX_MODEL_LEN_ENV)
-        except ValueError:
-            log.warning(
-                "Invalid TILT_MAX_LEN=%s, ignoring and using default.",
-                MAX_MODEL_LEN_ENV,
-            )
+# Max model length. The model advertises 125k, but that's very memory heavy.
+# You can override via env if needed.
+MAX_MODEL_LEN = int(os.getenv("TILT_MAX_MODEL_LEN", "125000"))
 
-    engine_args = EngineArgs.from_cli_args(args)
-    log.info("Creating LLMEngine with task=%s", engine_args.task)
-
-    llm_engine = LLMEngine.from_engine_args(engine_args)
-
-    tokenizer = llm_engine.get_tokenizer()
-    preprocessor = TiltPreprocessor.from_config(
-        model_config=llm_engine.model_config.hf_config,
-        tokenizer=tokenizer.backend_tokenizer,
-    )
-
-    return llm_engine, preprocessor
+DOWNLOAD_DIR = os.getenv("HF_HOME", "/workspace/cache/hf")
 
 
-llm_engine, preprocessor = _build_llm_engine()
-_engine_lock = threading.Lock()
-
-# -------------------------------------------------------------------------
-# Pydantic models: TILT request
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Pydantic request / response models
+# ---------------------------------------------------------------------------
 
 
 class OCRWord(BaseModel):
-    text: str = Field(..., description="Recognized token text")
-    bbox: List[float] = Field(
-        ...,
-        min_items=4,
-        max_items=4,
-        description="[x0,y0,x1,y1] in pixels",
-    )
+    text: str
+    bbox: List[float] = Field(..., min_items=4, max_items=4)
 
 
-class OCRPage(BaseModel):
-    width: int = Field(..., description="Page width in pixels")
-    height: int = Field(..., description="Page height in pixels")
-    words: List[OCRWord] = Field(
-        default_factory=list,
-        description="Words with absolute bboxes",
-    )
+class OCRContent(BaseModel):
+    width: int
+    height: int
+    words: List[OCRWord]
 
 
 class InputPage(BaseModel):
-    # OCR — основной источник данных (Paddle и т.п.)
-    ocr: Optional[OCRPage] = Field(
-        None, description="OCR result with word boxes in pixels"
-    )
-    # Картинка опциональна — для визуальных признаков.
-    image_b64: Optional[str] = Field(
-        None, description="Base64-encoded PNG/JPG of the page"
-    )
-    image_path: Optional[str] = Field(
-        None, description="Filesystem path to page image (mounted into container)"
-    )
+    # For now we only support OCR-only; later you can extend with image_url/base64.
+    ocr: OCRContent
 
 
 class TiltRequest(BaseModel):
-    question: str = Field(..., description="Doc-VQA / KIE question or instruction")
-    pages: List[InputPage] = Field(
-        ..., description="List of page images and/or OCR data"
-    )
-    model: Optional[str] = Field(
-        None, description="Override model name (optional)"
-    )
-    temperature: Optional[float] = Field(
-        None, description="Overrides default temperature"
-    )
-    max_tokens: Optional[int] = Field(
-        None, description="Overrides default max tokens"
-    )
+    question: str
+    pages: List[InputPage]
+    temperature: float = 0.0
+    max_tokens: int = 128
 
 
-# -------------------------------------------------------------------------
-# Helpers: InputPage -> TILT Document/Page
-# -------------------------------------------------------------------------
+class TiltChoice(BaseModel):
+    index: int
+    message: dict
+    finish_reason: str
 
 
-def _decode_image(page: InputPage) -> Image.Image:
-    """Получаем PIL.Image из image_b64 или image_path, либо создаём заглушку."""
-    if page.image_b64:
-        try:
-            raw = base64.b64decode(page.image_b64)
-            return Image.open(io.BytesIO(raw)).convert("RGB")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Failed to decode image_b64: %s", exc)
+class TiltUsage(BaseModel):
+    prompt_tokens: Optional[int]
+    completion_tokens: Optional[int]
+    total_tokens: Optional[int]
 
-    if page.image_path:
-        try:
-            return Image.open(page.image_path).convert("RGB")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Failed to open image_path=%s: %s", page.image_path, exc)
 
-    # Заглушка: белый лист A4
-    return Image.new(mode="L", size=(768, 1086), color=255)
+class TiltResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    model: str
+    choices: List[TiltChoice]
+    usage: TiltUsage
+    raw: Optional[dict] = None
 
+
+# ---------------------------------------------------------------------------
+# vLLM / TILT initialization
+# ---------------------------------------------------------------------------
+
+_parser = FlexibleArgumentParser()
+AsyncEngineArgs.add_cli_args(_parser, description="Arctic-TILT vLLM engine args")
+
+# Defaults aligned with examples/tilt_example.py
+_parser.set_defaults(
+    model=MODEL_NAME,
+    task="tilt_generate",
+    scheduler_cls="vllm.tilt.scheduler.Scheduler",
+    gpu_memory_utilization=GPU_UTIL,
+    dtype=DTYPE,
+    max_model_len=MAX_MODEL_LEN,
+    tensor_parallel_size=TP_SIZE,
+    max_num_seqs=16,
+    enforce_eager=True,
+    # Disable the async output processor (not supported by V1 engine yet, so
+    # vLLM will automatically fall back to the V0 engine – same as example).
+    disable_async_output_proc=True,
+)
+
+_args = _parser.parse_args([])
+
+engine_args = EngineArgs.from_cli_args(_args)
+
+logger.info(
+    "TILT config: model=%s, dtype=%s, tp=%d, gpu_util=%.2f, max_model_len=%d",
+    engine_args.model,
+    engine_args.dtype,
+    engine_args.tensor_parallel_size,
+    engine_args.gpu_memory_utilization,
+    engine_args.max_model_len,
+)
+
+# Single global engine & preprocessor – created once at import time.
+llm_engine: LLMEngine = LLMEngine.from_engine_args(engine_args)
+
+# HuggingFace tokenizer wrapper.
+_tokenizer = llm_engine.get_tokenizer()
+_model_config = llm_engine.model_config
+
+# Build TiltPreprocessor using HF config + tokenizer backend.
+preprocessor = TiltPreprocessor.from_config(
+    model_config=_model_config.hf_config,
+    tokenizer=_tokenizer.backend_tokenizer,
+)
+
+# Reasonable default sampling; per-request overrides allowed.
+DEFAULT_SP = SamplingParams(
+    temperature=0.0,
+    max_tokens=128,
+    logprobs=0,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helper: convert HTTP payload into TILT Document / Question objects
+# ---------------------------------------------------------------------------
 
 def _input_page_to_tilt_page(page: InputPage) -> Page:
-    img = _decode_image(page)
+    """Convert our InputPage into TILT's Page.
 
-    if page.ocr:
-        width = page.ocr.width
-        height = page.ocr.height
-        words = [w.text for w in page.ocr.words]
-        bboxes = []
-        for w in page.ocr.words:
-            try:
-                bboxes.append([float(v) for v in w.bbox])
-            except Exception:  # noqa: BLE001
-                continue
-    else:
-        width, height = img.size
-        words = []
-        bboxes = []
+    If no image is available (our case), we create a dummy white image with the
+    same resolution. TILT uses the image + the OCR tokens jointly, but the
+    white background still allows it to run.
+    """
+    ocr = page.ocr
+    words = [w.text for w in ocr.words]
+    bboxes = [w.bbox for w in ocr.words]
+
+    # Dummy white image; later you can replace with real page image if you have it.
+    img = Image.new("RGB", (ocr.width, ocr.height), color=(255, 255, 255))
 
     return Page(
         words=words,
         bboxes=bboxes,
-        width=width,
-        height=height,
+        width=ocr.width,
+        height=ocr.height,
         image=img,
     )
 
 
-# -------------------------------------------------------------------------
-# Core: один TILT-запрос через LLMEngine (с дебагом)
-# -------------------------------------------------------------------------
+def _build_document(req: TiltRequest) -> Document:
+    pages = [_input_page_to_tilt_page(p) for p in req.pages]
+    # We don't use dataset splits here, so split=None is fine.
+    return Document(ident="user-doc", split=None, pages=pages)
 
 
-def _run_tilt_inference(req: TiltRequest) -> Tuple[str, Optional[str]]:
+def _build_questions(req: TiltRequest) -> List[Question]:
+    # Arctic-TILT supports multiple questions per document; we use just one.
+    q_text = req.question.strip()
+    return [Question(key="q0", text=q_text)]
+
+
+def _run_tilt_inference(req: TiltRequest) -> tuple[str, dict]:
+    """Single-request inference loop following examples/tilt_example.py.
+
+    It:
+      1. builds Document + Question
+      2. preprocesses into TiltSample(s)
+      3. submits a single sample via llm_engine.add_request
+      4. loops over llm_engine.step() until that request finishes
     """
-    Выполнить один запрос TILT через LLMEngine, синхронно.
-    Возвращает (text, debug_repr).
-    """
-
-    if not req.pages:
-        raise HTTPException(status_code=400, detail="Request must contain at least one page.")
-
-    # Собираем Document и Question
-    doc_id = f"api-{int(time.time() * 1000)}"
-    tilt_pages = [_input_page_to_tilt_page(p) for p in req.pages]
-
-    document = Document(ident=doc_id, split=None, pages=tilt_pages)
-    questions = [Question(feature_name="answer", text=req.question)]
-
-    log.debug(
-        "Preprocessor input: doc_id=%s, pages=%d, question=%s",
-        doc_id,
-        len(tilt_pages),
-        req.question,
-    )
+    document = _build_document(req)
+    questions = _build_questions(req)
 
     samples = preprocessor.preprocess(document, questions)
     if not samples:
-        log.warning("Preprocessor returned no samples; returning empty answer.")
-        return "", None
+        raise RuntimeError("TILT preprocessor returned 0 samples – check OCR input.")
 
+    # We handle only one question, so we take the first sample.
     sample = samples[0]
 
-    # Sampling params (с учётом оверрайдов)
-    temperature = req.temperature if req.temperature is not None else DEFAULT_TEMPERATURE
-    max_tokens = req.max_tokens if req.max_tokens is not None else DEFAULT_MAX_TOKENS
-
-    sampling_params = SamplingParams(
-        temperature=temperature,
-        max_tokens=max_tokens,
-        logprobs=0,
+    sp = SamplingParams(
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+        logprobs=0,  # required by example_tilt.py / TILT task
     )
 
-    request_id = f"{doc_id}-q0"
-    final_output = None
+    request_id = f"tilt-{time.time_ns()}"
+    llm_engine.add_request(
+        prompt=sample,
+        request_id=request_id,
+        params=sp,
+    )
 
-    # Сериализуем доступ к движку
-    with _engine_lock:
-        llm_engine.add_request(
-            prompt=sample,
-            request_id=request_id,
-            params=sampling_params,
-        )
-
-        # Как в tilt_example: крутим step() пока наша заявка не закончится
-        while True:
-            request_outputs = llm_engine.step()
-            if not request_outputs:
-                # Теоретически может быть, если ещё ничего не готово
+    # Step loop – identical idea to examples/tilt_example.py: we iterate until
+    # the request with our ID reports finished=True.
+    while True:
+        request_outputs = llm_engine.step()
+        for out in request_outputs:
+            if out.request_id != request_id:
                 continue
-            for output in request_outputs:
-                if output.request_id == request_id and output.finished:
-                    final_output = output
-                    break
-            if final_output is not None:
-                break
+            if not out.finished:
+                # Not finished yet; continue stepping.
+                continue
 
-    if final_output is None:
-        log.warning("No RequestOutput from LLMEngine for request_id=%s", request_id)
-        return "", None
+            # We expect a single output for this request.
+            assert out.outputs, "No outputs from TILT request"
+            text = out.outputs[0].text
+            if text is None:
+                text = ""
 
-    outputs = getattr(final_output, "outputs", None) or []
-    if not outputs:
-        log.warning("RequestOutput.outputs is empty for request_id=%s", request_id)
-        return "", repr(final_output)
+            # Return text and raw output for debugging.
+            return text, {"output_repr": repr(out)}
 
-    first = outputs[0]
-    debug_repr = repr(first)
+        # No answer for us in this batch – sleep a tiny bit.
+        time.sleep(0.001)
 
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Arctic-TILT API", version="0.1.0")
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "model": MODEL_NAME}
+
+
+@app.post("/v1/tilt/generate", response_model=TiltResponse)
+async def tilt_generate(req: TiltRequest):
     try:
-        text = first.text
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Failed to extract text from outputs[0]: %s", exc)
-        return "", debug_repr
+        answer_text, raw = _run_tilt_inference(req)
+    except Exception as exc:
+        logger.exception("Error during TILT inference: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    if not isinstance(text, str):
-        text = str(text)
-
-    text = text.strip()
-    log.info("TILT output text=%r", text)
-
-    return text, debug_repr
-
-
-# -------------------------------------------------------------------------
-# API endpoints
-# -------------------------------------------------------------------------
-
-
-@app.post("/v1/tilt/generate")
-def tilt_generate(req: TiltRequest = Body(...)) -> Dict[str, Any]:
-    """
-    Низкоуровневый endpoint: напрямую принимает TiltRequest
-    (question + pages[ocr/image]) и возвращает OpenAI-like ответ.
-    """
-    text, debug_repr = _run_tilt_inference(req)
-
-    return {
-        "id": "tiltcmpl-1",
-        "object": "chat.completion",
-        "model": req.model or MODEL_NAME,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": None,
-            "completion_tokens": None,
-            "total_tokens": None,
-        },
-        # Для дебага: repr первого completion; если совсем пусто —
-        # будет None или repr(final_output).
-        "raw": {"output_repr": debug_repr} if debug_repr is not None else None,
-    }
-
-
-@app.get("/v1/health")
-def health() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "model": MODEL_NAME,
-        "dtype": DTYPE,
-        "gpu_util": GPU_UTIL,
-    }
-
-
-# -------------------------------------------------------------------------
-# Опциональный warmup (через полный пайплайн, но с try/except)
-# -------------------------------------------------------------------------
-
-try:
-    dummy_req = TiltRequest(
-        question="ping",
-        pages=[
-            InputPage(
-                ocr=OCRPage(width=768, height=1086, words=[]),
-            )
-        ],
+    # Build OpenAI-compatible-ish response.
+    choice = TiltChoice(
+        index=0,
+        message={"role": "assistant", "content": answer_text},
+        finish_reason="stop",
     )
-    _ = _run_tilt_inference(dummy_req)
-    log.info("Warmup for TILT completed (or returned empty, but no crash).")
-except Exception as exc:  # noqa: BLE001
-    log.warning("Warmup failed (non-fatal): %s", exc)
+
+    usage = TiltUsage(
+        prompt_tokens=None,
+        completion_tokens=None,
+        total_tokens=None,
+    )
+
+    # id is not strictly important; we use a dummy.
+    resp = TiltResponse(
+        id="tiltcmpl-1",
+        model=MODEL_NAME,
+        choices=[choice],
+        usage=usage,
+        raw=raw,
+    )
+    return resp
