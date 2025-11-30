@@ -29,6 +29,7 @@ RUN apt-get update && \
         libsm6 \
         libxext6 \
         libxrender1 \
+        libgl1 \
     && ln -sf /usr/bin/python3.10 /usr/bin/python \
     && ln -sf /usr/bin/pip3 /usr/bin/pip \
     && rm -rf /var/lib/apt/lists/*

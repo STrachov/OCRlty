@@ -49,6 +49,7 @@ for critical in ("torch", "vllm"):
         sys.exit(1)
 
 PY
+
 # Где лежит репозиторий на volume
 APP_REPO_URL="${APP_REPO_URL:-https://github.com/STrachov/OCRlty.git}"
 APP_SRC_ROOT="${APP_SRC_ROOT:-/workspace/src}"   # тут живёт git-копия
@@ -93,22 +94,78 @@ fi
 
 echo "[entrypoint] Final APP_ROOT=${APP_ROOT}"
 
-# ---------------------------- Старт uvicorn -----------------------------------
+# -------------------------- Debug sleep (optional) -----------------------------
+if [ "${SLEEP_ON_START:-0}" = "1" ]; then
+  echo "[entrypoint] SLEEP_ON_START=1 → sleeping indefinitely for debug..."
+  exec tail -f /dev/null
+fi
+
+# ---------------------------- Порты и ENV -------------------------------------
+
+API_PORT="${API_PORT:-8000}"
+TILT_PORT="${TILT_PORT:-${VLLM_PORT:-8001}}"
+
+echo "[entrypoint] API_PORT=${API_PORT}"
+echo "[entrypoint] TILT_PORT=${TILT_PORT}"
+
+# URL TILT-бэкенда для основного API (если не задан снаружи)
+TILT_BASE_URL="http://127.0.0.1:${TILT_PORT}"
+export VLLM_BASE_URL="${VLLM_BASE_URL:-${TILT_BASE_URL}/v1}"
+
+echo "[entrypoint] VLLM_BASE_URL=${VLLM_BASE_URL}"
+
+# ---------------------------- Старт процессов ---------------------------------
 
 UVICORN_EXTRA_ARGS=""
-
 # Для dev-подов можно включать хот-релоад (подхватывает изменения после git pull)
 # if [ "${UVICORN_RELOAD:-0}" = "1" ]; then
 #   UVICORN_EXTRA_ARGS="--reload"
 #   echo "[entrypoint] Uvicorn reload mode ENABLED"
 # fi
 UVICORN_EXTRA_ARGS="--reload"
-echo "[entrypoint] Starting uvicorn apps.tilt_api:app from ${APP_ROOT} on 0.0.0.0:8001"
+
+# Ограничиваем потоки для OCR (Paddle / OpenCV)
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 
 cd "${APP_ROOT}"
 
-exec python -m uvicorn apps.tilt_api:app \
+# --- 1) GPU: tilt_api (Arctic-TILT + vLLM) на :TILT_PORT ---
+echo "[entrypoint] Starting tilt_api (GPU) from ${APP_ROOT} on 0.0.0.0:${TILT_PORT}"
+
+python -m uvicorn apps.tilt_api:app \
     --app-dir "${APP_ROOT}" \
     --host 0.0.0.0 \
-    --port 8001 \
+    --port "${TILT_PORT}" \
+    ${UVICORN_EXTRA_ARGS} &
+TILT_PID=$!
+
+# Ждём готовности tilt_api
+echo "[entrypoint] Waiting for tilt_api at ${TILT_BASE_URL}/v1/health ..."
+TILT_READY=0
+for i in $(seq 1 60); do
+  if curl -fsS "${TILT_BASE_URL}/v1/health" >/dev/null 2>&1; then
+    echo "[entrypoint] tilt_api is UP (attempt ${i})"
+    TILT_READY=1
+    break
+  fi
+  echo "[entrypoint] tilt_api not ready yet, retry ${i}/60..."
+  sleep 2
+done
+
+if [ "${TILT_READY}" -ne 1 ]; then
+  echo "[entrypoint] ERROR: tilt_api failed to become ready, exiting."
+  # Пытаемся аккуратно завершить tilt_api
+  if kill "${TILT_PID}" 2>/dev/null; then
+    wait "${TILT_PID}" || true
+  fi
+  exit 1
+fi
+
+# --- 2) CPU: основной API (OCR + TILT client) на :API_PORT ---
+echo "[entrypoint] Starting main API (OCR+TILT) on 0.0.0.0:${API_PORT}"
+
+exec python -m uvicorn main:app \
+    --app-dir "${APP_ROOT}" \
+    --host 0.0.0.0 \
+    --port "${API_PORT}" \
     ${UVICORN_EXTRA_ARGS}

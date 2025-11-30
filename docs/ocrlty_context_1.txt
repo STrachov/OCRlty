@@ -1,5 +1,5 @@
 # OCRlty — Контекст и план (CPU-OCR + GPU-TILT в одном поде RunPod)
-**TL;DR**: На проде запускаем один под на RunPod, где в одном контейнере крутятся **vLLM + Arctic-TILT (GPU)** и **FastAPI + PaddleOCR 3.x (CPU)**. OCR выполняется на CPU с ограниченным параллелизмом; TILT вызывается асинхронно через OpenAI-совместимый vLLM (`/v1/chat/completions`). Для локалки — Docker Desktop + WSL2, мок vLLM.
+**TL;DR**: На проде запускаем один под на RunPod, где в одном контейнере крутятся **FastAPI + (vLLM + Arctic-TILT) (GPU)** и **FastAPI + PaddleOCR 3.x (CPU)**. OCR выполняется на CPU с ограниченным параллелизмом; TILT вызывается асинхронно через обертку FastAPI. Для локалки — Docker Desktop + WSL2, мок vLLM.
 ---
 ## 1) Цели и границы (без клиентской части)
 - **Цель**: сервис Dev-API, принимающий PDF/JPG/PNG счетов/инвойсов и возвращающий нормализованный JSON (merchant, date, currency, subtotal, tax_amount, total).
@@ -18,14 +18,38 @@
 1) API читает файл, при необходимости рендерит PDF → PNG (pypdfium2).
 2) **PaddleOCR.predict** (CPU) → детект и распознавание строк (параллелим ограниченно).
 3) Формируем **OCR Document** (`pages[].{width,height,spans[{bbox,text}]}`).
-4) Шлём в vLLM `/v1/chat/completions` с `messages=[{"type":"input_ocr_document",...}]`.
+4) Шлём в vLLM `/v1/tilt/generate` с запросом типа:
+curl -X POST "http://127.0.0.1:8001/v1/tilt/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What is the total amount on this document? Answer only the number.",
+    "temperature": 0.0,
+    "max_tokens": 8,
+    "pages": [
+      {
+        "ocr": {
+          "width": 1000,
+          "height": 1400,
+          "words": [
+            { "text": "Total",    "bbox": [100, 200, 220, 230] },
+            { "text": "56",       "bbox": [230, 200, 340, 230] },
+            ...
+            { "text": "VAT",      "bbox": [100, 260, 170, 290] },
+            { "text": "20%",      "bbox": [180, 260, 230, 290] }
+          ]
+        }
+      }
+    ]
+  }'
+
 5) Парсим JSON, применяем правила нормализации, отдаём ответ.
 
 ---
 
 ## 3) Репозиторий (структура)
 ├─ apps/
-│ └─ api_gpu/ # FastAPI + inference + OpenAPI
+│ ├─ api_gpu/ # FastAPI + inference 
+│ └─ tilt_api.py/ # FastAPI + vLLM + Arctic-TILT
 ├─ configs/ # yaml/json конфиги моделей/правил/локалей
 ├─ docs/ # OpenAPI-export, примеры, диаграммы, SLA
 ├─ lib/
@@ -36,18 +60,17 @@
 │ └─ post/rules.py # нормализация/валидации (даты/валюты/сумм)
 ├─ notebooks/
 │ └─ gpu/ # R&D
-├─ samples/ # эталоны и входные файлы
-├─ scripts/ # build, warmup, eval, bootstrap, entrypoints
-│  ├─ entrypoint.sh         # (GPU) vLLM (TILT) → ожидание → FastAPI
+├─ tests/ # пока входные файлы (потом unit + integ + e2e)
+├─ scripts/ # build, warmup, eval, bootstrap 
 │  ├─ mock_vllm.py         # (CPU) локальный mock OpenAI API
 │  └─ bootstrap_*.sh       # утилиты установки/проверки
-├─ tests/ # unit + integ + e2e
 ├─ pyproject.toml
 ├─ requirements-cpu.txt
 ├─ requirements-gpu.txt
 ├─ docker-compose.dev.yml
 ├─ Dockerfile.dev
-├─ Dockerfile.prod
+├─ Dockerfile
+├─ entrypoint.py
 └─ README.md
 > Важно: директория **`apps/api_gpu/`** (подчёркивание, не дефис) и файлы `__init__.py` в `apps/` и `apps/api_gpu/` для корректного импорта.
 
