@@ -164,7 +164,7 @@ fi
 # --- 2) CPU: основной API (OCR + TILT client) на :API_PORT ---
 echo "[entrypoint] Starting main API (OCR+TILT) on 0.0.0.0:${API_PORT}"
 
-exec python -m uvicorn main:app \
+exec python -m uvicorn apps.api_gpu.main:app \
     --app-dir "${APP_ROOT}" \
     --host 0.0.0.0 \
     --port "${API_PORT}" \
