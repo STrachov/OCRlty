@@ -1,0 +1,24 @@
+curl -X POST "http://0.0.0.0:8000/v1/health" 
+
+curl -X POST "http://127.0.0.1:8001/v1/tilt/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What is the total amount on this document? Answer only the number.",
+    "temperature": 0.0,
+    "max_tokens": 8,
+    "pages": [
+      {
+        "ocr": {
+          "width": 1000,
+          "height": 1400,
+          "words": [
+            { "text": "Total",    "bbox": [100, 200, 220, 230] },
+            { "text": "56",       "bbox": [230, 200, 340, 230] },
+            { "text": "VAT",      "bbox": [100, 260, 170, 290] },
+            { "text": "20%",      "bbox": [180, 260, 230, 290] }
+          ]
+        }
+      }
+    ]
+  }'
+

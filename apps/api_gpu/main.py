@@ -28,8 +28,10 @@ CORS_ALLOW_ORIGINS = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").sp
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 ALLOWED_CONTENT_TYPES = {
-    ct.strip() for ct in os.getenv(
-        "ALLOWED_CONTENT_TYPES", "application/pdf,image/jpeg,image/png"
+    ct.strip()
+    for ct in os.getenv(
+        "ALLOWED_CONTENT_TYPES",
+        "application/pdf,image/jpeg,image/png",
     ).split(",")
 }
 
@@ -45,7 +47,10 @@ async def lifespan(app: FastAPI):
     global tilt
     log.info(
         "Starting API; VLLM_BASE_URL=%s, MODEL=%s, MOCK_VLLM=%s, RULES_ENABLED=%s",
-        VLLM_BASE_URL, TILT_MODEL, MOCK_VLLM, RULES_ENABLED,
+        VLLM_BASE_URL,
+        TILT_MODEL,
+        MOCK_VLLM,
+        RULES_ENABLED,
     )
     tilt = ArcticTiltClient(
         base_url=VLLM_BASE_URL,
@@ -53,31 +58,32 @@ async def lifespan(app: FastAPI):
         timeout=TILT_TIMEOUT_S,
         api_key=VLLM_API_KEY,
     )
-    # Лёгкий ping /v1/models (не критично)
-    # try:
-    #     with httpx.Client(timeout=5.0) as cli:
-    #         r = cli.get(f"{VLLM_BASE_URL}/models", headers={"Authorization": f"Bearer {VLLM_API_KEY}"})
-    #         r.raise_for_status()
-    #         models = r.json().get("data", [])
-    #         ids = [m.get("id") for m in models if isinstance(m, dict)]
-    #         if TILT_MODEL not in ids:
-    #             log.warning("Model '%s' not in /models list: %s", TILT_MODEL, ids)
-    #         else:
-    #             log.info("vLLM ready; model found: %s", TILT_MODEL)
-    # except Exception as e:
-    #     log.warning("vLLM /models ping failed: %s", e)
+    # Лёгкий ping tilt_api /v1/health (не критично для старта)
+    try:
+        with httpx.Client(timeout=5.0) as cli:
+            r = cli.get(f"{VLLM_BASE_URL}/health")
+            r.raise_for_status()
+            health = r.json()
+            log.info(
+                "tilt_api ready; model=%s, dtype=%s, tp=%s",
+                health.get("model"),
+                health.get("dtype"),
+                health.get("tp_size"),
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("tilt_api /health ping failed: %s", e)
 
     yield
 
     try:
-        if tilt and hasattr(tilt, "close"):
-            tilt.close()  # type: ignore[attr-defined]
-    except Exception as e:
-        log.warning("Tilt client close failed: %s", e)
+        if tilt is not None:
+            tilt.close()
+    except Exception as e:  # noqa: BLE001
+        log.warning("Error while closing ArcticTiltClient: %s", e)
 
 
 app = FastAPI(
-    title="Arctic-TILT Inference API",
+    title="OCRlty Arctic-TILT API (GPU)",
     version=os.getenv("API_VERSION", "0.1.0"),
     docs_url="/docs",
     openapi_url="/openapi.json",
@@ -94,20 +100,30 @@ if ENABLE_CORS:
     )
 
 
-@app.get("/v1/health", tags=["system"])
+@app.get("/v1/health", tags=["meta"])
 def health() -> Dict[str, Any]:
-    vllm_ok = False
+    """Проверка живости API + proxied health от tilt_api."""
+    tilt_ok = False
+    tilt_info: Dict[str, Any] | None = None
     try:
         with httpx.Client(timeout=2.0) as cli:
-            r = cli.get(f"{VLLM_BASE_URL}/models", headers={"Authorization": f"Bearer {VLLM_API_KEY}"})
+            r = cli.get(f"{VLLM_BASE_URL}/health")
             r.raise_for_status()
-            vllm_ok = True
-    except Exception:
-        vllm_ok = False
+            tilt_info = r.json()
+            tilt_ok = True
+    except Exception as e:  # noqa: BLE001
+        tilt_ok = False
+        tilt_info = {"error": str(e)}
 
     return {
         "status": "ok",
-        "vllm": {"base_url": VLLM_BASE_URL, "model": TILT_MODEL, "reachable": vllm_ok, "mock": MOCK_VLLM},
+        "tilt": {
+            "base_url": VLLM_BASE_URL,
+            "model": TILT_MODEL,
+            "reachable": tilt_ok,
+            "mock": MOCK_VLLM,
+            "info": tilt_info,
+        },
         "versions": {
             "api": app.version,
             "ruleset_version": os.getenv("RULESET_VERSION", "rules-0.1.0"),
@@ -128,32 +144,39 @@ async def extract(file: UploadFile = File(...)) -> Dict[str, Any]:
             detail=f"Unsupported content-type '{file.content_type}'. Allowed: {sorted(ALLOWED_CONTENT_TYPES)}",
         )
 
-    try:
-        content = await file.read()
-        if not content:
-            raise ValueError("empty file")
-        if len(content) > MAX_UPLOAD_MB * 1024 * 1024:
-            raise HTTPException(status_code=413, detail=f"File too large (> {MAX_UPLOAD_MB} MB)")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read upload: {e}")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
 
-    request_id = str(uuid.uuid4())
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large: {len(content)} bytes > {max_bytes} bytes",
+        )
+
+    request_id = uuid.uuid4().hex
+    log.info(
+        "Request %s: filename=%s, content_type=%s, size=%d bytes",
+        request_id,
+        file.filename,
+        file.content_type,
+        len(content),
+    )
 
     try:
-        fields = tilt.infer(content)
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"vLLM error: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"TILT inference error: {e}")
+        # важно передать content_type, чтобы корректно определить PDF vs image
+        fields = tilt.infer(content, content_type=file.content_type or None)
+    except Exception as e:  # noqa: BLE001
+        log.exception("TILT inference failed for request %s: %s", request_id, e)
+        raise HTTPException(status_code=500, detail=f"TILT inference failed: {e}") from e
 
     if RULES_ENABLED:
         try:
             fields = postprocess_rules(fields)
-        except Exception as e:
-            # если правила отвалились — вернём сырые поля, но не урони́м запрос
-            log.warning("postprocess_rules failed: %s", e)
+        except Exception as e:  # noqa: BLE001
+            # если правила отвалились — вернём сырые поля, но не уроним запрос
+            log.warning("postprocess_rules failed for request %s: %s", request_id, e)
 
     return {
         "data": fields,
