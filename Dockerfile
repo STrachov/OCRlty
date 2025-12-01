@@ -61,7 +61,8 @@ RUN python3.10 -m venv /opt/venv \
       https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/vllm-0.8.3-cp310-cp310-linux_x86_64.whl \
       https://github.com/STrachov/OCRlty/releases/download/tilt-vllm-cu124-py310-torch26/xformers-0.0.29.post2-cp310-cp310-manylinux_2_28_x86_64.whl
 
-RUN /opt/venv/bin/pip uninstall -y paddlex || true
+#RUN /opt/venv/bin/pip uninstall -y paddlex || true
+
 
 # В рантайме всегда используем /opt/venv/bin/python и видим /opt/app/sitecustomize.py
 ENV PATH=/opt/venv/bin:$PATH \
