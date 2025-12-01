@@ -168,20 +168,21 @@ class ArcticTiltClient:
     def _init_ocr(self) -> None:
         """Ленивый и безопасный init PaddleOCR."""
         if PaddleOCR is None:
-            self._ocr_err = RuntimeError("paddleocr is not installed")
+            self._ocr_err = RuntimeError("paddleocr import failed (module not found)")
             return
         if np is None:
             self._ocr_err = RuntimeError("numpy is not installed")
             return
         try:
-            # Только CPU — GPU занят TILT'ом
             self._ocr = PaddleOCR(
                 lang=self.ocr_lang,
                 use_angle_cls=True,
                 use_gpu=False,
                 show_log=False,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
+            # здесь важно сохранить ИМЕННО оригинальное исключение,
+            # чтобы в логе и в HTTP 500 увидеть реальную причину
             self._ocr_err = exc
 
     # ----- HTTP к tilt_api -----
