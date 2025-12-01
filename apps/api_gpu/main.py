@@ -54,18 +54,18 @@ async def lifespan(app: FastAPI):
         api_key=VLLM_API_KEY,
     )
     # Лёгкий ping /v1/models (не критично)
-    try:
-        with httpx.Client(timeout=5.0) as cli:
-            r = cli.get(f"{VLLM_BASE_URL}/models", headers={"Authorization": f"Bearer {VLLM_API_KEY}"})
-            r.raise_for_status()
-            models = r.json().get("data", [])
-            ids = [m.get("id") for m in models if isinstance(m, dict)]
-            if TILT_MODEL not in ids:
-                log.warning("Model '%s' not in /models list: %s", TILT_MODEL, ids)
-            else:
-                log.info("vLLM ready; model found: %s", TILT_MODEL)
-    except Exception as e:
-        log.warning("vLLM /models ping failed: %s", e)
+    # try:
+    #     with httpx.Client(timeout=5.0) as cli:
+    #         r = cli.get(f"{VLLM_BASE_URL}/models", headers={"Authorization": f"Bearer {VLLM_API_KEY}"})
+    #         r.raise_for_status()
+    #         models = r.json().get("data", [])
+    #         ids = [m.get("id") for m in models if isinstance(m, dict)]
+    #         if TILT_MODEL not in ids:
+    #             log.warning("Model '%s' not in /models list: %s", TILT_MODEL, ids)
+    #         else:
+    #             log.info("vLLM ready; model found: %s", TILT_MODEL)
+    # except Exception as e:
+    #     log.warning("vLLM /models ping failed: %s", e)
 
     yield
 
