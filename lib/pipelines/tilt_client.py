@@ -178,7 +178,7 @@ class ArcticTiltClient:
                 lang=self.ocr_lang,
                 use_angle_cls=True,
                 #use_gpu=False,
-                show_log=False,
+                #show_log=False,
             )
         except Exception as exc:
             # здесь важно сохранить ИМЕННО оригинальное исключение,
