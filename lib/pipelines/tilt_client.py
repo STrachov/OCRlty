@@ -177,7 +177,7 @@ class ArcticTiltClient:
             self._ocr = PaddleOCR(
                 lang=self.ocr_lang,
                 use_angle_cls=True,
-                use_gpu=False,
+                #use_gpu=False,
                 show_log=False,
             )
         except Exception as exc:
