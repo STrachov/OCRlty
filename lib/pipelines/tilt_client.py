@@ -288,7 +288,10 @@ class ArcticTiltClient:
 
         np_img = np.array(image)
         try:
-            result = self._ocr.ocr(np_img, cls=True)
+            result = self._ocr.ocr(
+                np_img, 
+                #cls=True
+                )
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"OCR failed: {exc}") from exc
 
