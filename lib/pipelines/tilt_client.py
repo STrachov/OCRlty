@@ -377,8 +377,23 @@ class ArcticTiltClient:
             raise RuntimeError("No pages produced from input document")
 
         pages_payload: List[Dict[str, Any]] = []
-        for img in images:
+        total_words = 0
+        for page_idx, img in enumerate(images):
             w, h, words = self._run_ocr(img)
+            total_words += len(words)
+            logger.info(
+                "TILT client OCR: page %d -> size=(%d x %d), words=%d",
+                page_idx,
+                w,
+                h,
+                len(words),
+            )
+            if words:
+                logger.debug(
+                    "TILT client OCR: page %d, first 5 words: %s",
+                    page_idx,
+                    [w["text"] for w in words[:5]],
+                )
             ocr_page = {
                 "width": int(w),
                 "height": int(h),
@@ -386,11 +401,21 @@ class ArcticTiltClient:
             }
             pages_payload.append({"ocr": ocr_page})
 
+        if not total_words:
+            # Чтобы не выстрелить TILT'у по пустому
+            raise RuntimeError("OCR produced zero words on all pages")
+
         payload: Dict[str, Any] = {
             "question": self.question,
             "pages": pages_payload,
             "model": self.model,
         }
+
+        logger.info(
+            "Sending TILT request: pages=%d, total_words=%d",
+            len(pages_payload),
+            total_words,
+        )
 
         resp = self._post_tilt(payload)
 

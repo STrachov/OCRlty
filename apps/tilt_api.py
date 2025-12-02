@@ -251,8 +251,30 @@ def _input_page_to_tilt_page(page: InputPage) -> Page:
 
 def _build_document(req: TiltRequest) -> Document:
     doc_id = f"api-{int(time.time() * 1000)}"
-    pages = [_input_page_to_tilt_page(p) for p in req.pages]
-    return Document(ident=doc_id, split=None, pages=pages)
+
+    tilt_pages: List[Page] = []
+    for idx, p in enumerate(req.pages):
+        tilt_page = _input_page_to_tilt_page(p)
+        # Важно: если после OCR у страницы нет ни одного слова — TILT-пайплайн
+        # потом может развалиться с IndexError. Отфильтруем такие страницы.
+        if not tilt_page.words:
+            log.warning(
+                "Skipping page %d: no OCR words (width=%s, height=%s)",
+                idx,
+                getattr(tilt_page, "width", None),
+                getattr(tilt_page, "height", None),
+            )
+            continue
+        tilt_pages.append(tilt_page)
+
+    if not tilt_pages:
+        # Явная, понятная ошибка вместо внутреннего IndexError в TiltPreprocessor
+        raise HTTPException(
+            status_code=400,
+            detail="No valid OCR words found on any page for TILT.",
+        )
+
+    return Document(ident=doc_id, split=None, pages=tilt_pages)
 
 
 def _build_questions(req: TiltRequest) -> List[Question]:
@@ -283,9 +305,35 @@ def _run_tilt_inference(req: TiltRequest) -> Tuple[str, Optional[str]]:
     document = _build_document(req)
     questions = _build_questions(req)
 
-    samples = preprocessor.preprocess(document, questions)
+    try:
+        samples = preprocessor.preprocess(document, questions)
+    except IndexError as exc:
+        # Это как раз тот случай: page_token_ids пустые и т.п.
+        log.exception(
+            "TiltPreprocessor.preprocess raised IndexError. "
+            "Likely no tokens were produced from OCR / bboxes. "
+            "document_id=%s, num_pages=%d",
+            document.ident,
+            len(getattr(document, "pages", [])),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="TILT preprocessing failed: no page tokens produced from OCR.",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        log.exception("TiltPreprocessor.preprocess failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=f"TILT preprocessing failed: {exc}",
+        ) from exc
+
     if not samples:
-        log.warning("TiltPreprocessor returned no samples for document %s", document.ident)
+        log.warning(
+            "TiltPreprocessor.preprocess returned empty samples, "
+            "document_id=%s, num_pages=%d",
+            document.ident,
+            len(getattr(document, "pages", [])),
+        )
         return "", None
 
     sample = samples[0]
