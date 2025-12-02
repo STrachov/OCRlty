@@ -22,3 +22,10 @@ curl -X POST "http://127.0.0.1:8001/v1/tilt/generate" \
     ]
   }'
 
+curl -X POST "http://127.0.0.1:8000/v1/extract" \
+  -H "Accept: application/json" \
+  -F "file=@tests/reciept_1.png;type=image/png"
+
+curl -X POST "http://127.0.0.1:8000/v1/extract" \
+  -H "Accept: application/json" \
+  -F "file=@tests/test_ocr.png;type=image/png"

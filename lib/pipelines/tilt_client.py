@@ -9,8 +9,31 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import logging
+import tempfile
 
 logger = logging.getLogger(__name__)
+
+class PaddleOcrWrapper:
+    def __init__(self, min_confidence: float = 0.3) -> None:
+        self._ocr = None
+        self._ocr_err: Exception | None = None
+        self.min_confidence = min_confidence
+
+    # ленивый старт, чтобы /health работал даже без моделей
+    def _ensure_ocr(self) -> None:
+        if self._ocr is not None or self._ocr_err is not None:
+            return
+
+        try:
+            # В PaddleOCR 3.x PaddleX приезжает как зависимость.
+            from paddlex import create_pipeline  # type: ignore
+
+            # Берём общий пайплайн "OCR" (детекция + распознавание).
+            self._ocr = create_pipeline(pipeline="OCR")
+            logger.info("PaddleX OCR pipeline initialized")
+        except Exception as e:
+            self._ocr_err = e
+            logger.error("Failed to initialize PaddleX OCR: %r", e)
 
 # Опциональные тяжёлые зависимости: используем ленивый импорт
 try:  # Pillow для работы с изображениями
@@ -308,46 +331,120 @@ class ArcticTiltClient:
 
     # ----- OCR → TiltRequest.pages -----
 
-    def _run_ocr(self, image: "Image.Image") -> Tuple[int, int, List[Dict[str, Any]]]:
+    def _run_ocr(self, img: Image.Image) -> Tuple[int, int, List[Dict[str, Any]]]:
+        """
+        Возвращает:
+          - width, height картинки
+          - список слов вида {"text": str, "bbox": [x1, y1, x2, y2], "score": float}
+        """
+        self._ensure_ocr()
         if self._ocr_err is not None:
             raise RuntimeError(f"PaddleOCR initialization failed: {self._ocr_err!r}")
-        if self._ocr is None or np is None:
-            raise RuntimeError("PaddleOCR is not available")
 
-        np_img = np.array(image)
+        # Приводим к RGB и сохраняем во временный файл — так точно совместимо
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+
+        w, h = img.size
+
+        fd, tmp_path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
         try:
-            result = self._ocr.ocr(
-                np_img, 
-                #cls=True
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("OCR failed")
-            raise RuntimeError(f"OCR failed: {exc}") from exc
+            img.save(tmp_path, format="PNG")
 
-        width, height = image.size
-        words: List[Dict[str, Any]] = []
+            # PaddleX pipeline: первый позиционный аргумент — input
+            try:
+                raw_out = self._ocr.predict([tmp_path])
+            except TypeError:
+                # на всякий случай — вдруг сигнатура только с именованным input
+                raw_out = self._ocr.predict(input=[tmp_path])
 
-        # result — это список страниц; мы передали одну картинку,
-        # поэтому берём лишь первый элемент
-        for page in result or []:
-            for det in page:
-                # формат: [box, (text, score)]
-                if len(det) == 3:
-                    box, txt, score = det
-                elif len(det) == 2:
-                    box, (txt, score) = det
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+        if not raw_out:
+            logger.warning("PaddleOCR returned empty output list")
+            return w, h, []
+
+        page0 = raw_out[0]
+
+        # У разных версий это или объект с .res, или dict с ключом "res"
+        if hasattr(page0, "res"):
+            res = page0.res
+        elif isinstance(page0, dict) and "res" in page0:
+            res = page0["res"]
+        else:
+            # крайне маловероятно, но на всякий случай логируем
+            logger.warning("Unexpected PaddleOCR output type: %r", type(page0))
+            return w, h, []
+
+        if hasattr(res, "__dict__") and not isinstance(res, dict):
+            res = res.__dict__
+
+        if not isinstance(res, dict):
+            logger.warning("PaddleOCR .res is not a dict: %r", type(res))
+            return w, h, []
+
+        # PaddleX 3.x: rec_boxes / rec_texts / rec_scores
+        boxes = res.get("rec_boxes") or res.get("dt_polys")
+        texts = res.get("rec_texts") or res.get("rec_text")
+        scores = res.get("rec_scores") or res.get("rec_score")
+
+        if boxes is None or texts is None:
+            logger.warning("PaddleOCR result has no boxes/texts keys: keys=%s", list(res.keys()))
+            return w, h, []
+
+        # Приводим боксы к numpy для удобства
+        try:
+            boxes_arr = np.array(boxes)
+        except Exception:
+            boxes_arr = boxes
+
+        out_words: List[Dict[str, Any]] = []
+
+        for idx, (box, text) in enumerate(zip(boxes_arr, texts)):
+            if not text:
+                continue
+            score = 1.0
+            if scores is not None and idx < len(scores):
+                try:
+                    score = float(scores[idx])
+                except Exception:
+                    pass
+
+            if score < self.min_confidence:
+                continue
+
+            # box может быть:
+            # - [x1, y1, x2, y2] (rec_boxes)
+            # - [4, 2] массив полигона (dt_polys)
+            # - список из 8 координат
+            x1 = y1 = x2 = y2 = 0.0
+
+            try:
+                if hasattr(box, "shape") and len(box.shape) == 2:
+                    xs = box[:, 0]
+                    ys = box[:, 1]
+                    x1, y1, x2, y2 = float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
+                elif len(box) == 4:
+                    x1, y1, x2, y2 = map(float, box)
                 else:
-                    continue
-        
-                txt = (txt or "").strip()
-                if not txt:
-                    continue
-                xs = [float(p[0]) for p in box]
-                ys = [float(p[1]) for p in box]
-                bbox = [min(xs), min(ys), max(xs), max(ys)]
-                words.append({"text": txt, "bbox": bbox})
+                    xs = box[0::2]
+                    ys = box[1::2]
+                    x1, y1, x2, y2 = float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))
+            except Exception:
+                logger.debug("Failed to parse box #%d: %r", idx, box)
+                continue
 
-        return width, height, words
+            out_words.append(
+                {"text": str(text), "bbox": [x1, y1, x2, y2], "score": score}
+            )
+
+        logger.info("PaddleOCR returned %d words (after filtering)", len(out_words))
+        return w, h, out_words
 
     # ----- парсинг ответа модели -----
 
