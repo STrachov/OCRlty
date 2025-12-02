@@ -8,6 +8,9 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Опциональные тяжёлые зависимости: используем ленивый импорт
 try:  # Pillow для работы с изображениями
@@ -169,21 +172,23 @@ class ArcticTiltClient:
         """Ленивый и безопасный init PaddleOCR."""
         if PaddleOCR is None:
             self._ocr_err = RuntimeError("paddleocr import failed (module not found)")
+            logger.error("PaddleOCR import failed: module not found")
             return
         if np is None:
             self._ocr_err = RuntimeError("numpy is not installed")
+            logger.error("PaddleOCR init failed: numpy is not installed")
             return
         try:
             self._ocr = PaddleOCR(
                 lang=self.ocr_lang,
-                use_angle_cls=True,
-                #use_gpu=False,
-                #show_log=False,
+                use_angle_cls=True,  # только DeprecationWarning — это ок
             )
+            logger.info("PaddleOCR initialized (lang=%s)", self.ocr_lang)
         except Exception as exc:
-            # здесь важно сохранить ИМЕННО оригинальное исключение,
-            # чтобы в логе и в HTTP 500 увидеть реальную причину
+            # важно сохранить оригинальное исключение
             self._ocr_err = exc
+            logger.exception("PaddleOCR initialization failed")
+
 
     # ----- HTTP к tilt_api -----
 
@@ -196,23 +201,46 @@ class ArcticTiltClient:
     def _post_tilt(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.base_url}/tilt/generate"
         last_exc: Optional[Exception] = None
+        last_body: Optional[str] = None
 
         for attempt in range(1, self.max_retries + 1):
             try:
+                logger.info(
+                    "Calling TILT at %s (attempt %d), pages=%d",
+                    url,
+                    attempt,
+                    len(payload.get("pages", [])),
+                )
                 resp = self._cli.post(url, json=payload, headers=self._headers())
                 resp.raise_for_status()
                 return resp.json()
             except Exception as e:  # noqa: BLE001
                 last_exc = e
+                body = None
+                if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                    try:
+                        body = e.response.text
+                    except Exception:
+                        body = "<failed to read response body>"
+                last_body = body
+                logger.warning(
+                    "TILT request failed (attempt %d/%d): %r, body=%s",
+                    attempt,
+                    self.max_retries,
+                    e,
+                    body,
+                )
                 # HTTP 4xx повторять смысла нет
-                if isinstance(e, httpx.HTTPStatusError) and 400 <= e.response.status_code < 500:
+                if isinstance(e, httpx.HTTPStatusError) and 400 <= e.response.status_code < 500:  # type: ignore[union-attr]
                     break
                 if attempt >= self.max_retries:
                     break
                 time.sleep(self.retry_backoff_s)
 
         if last_exc is not None:
-            raise RuntimeError(f"Error calling {url}: {last_exc}") from last_exc
+            raise RuntimeError(
+                f"Error calling {url}: {last_exc} (response_body={last_body})"
+            ) from last_exc
         raise RuntimeError(f"Unknown error calling {url}")
 
     # ----- Bytes → изображения -----
@@ -293,6 +321,7 @@ class ArcticTiltClient:
                 #cls=True
                 )
         except Exception as exc:  # noqa: BLE001
+            logger.exception("OCR failed")
             raise RuntimeError(f"OCR failed: {exc}") from exc
 
         width, height = image.size
@@ -303,10 +332,13 @@ class ArcticTiltClient:
         for page in result or []:
             for det in page:
                 # формат: [box, (text, score)]
-                try:
+                if len(det) == 3:
+                    box, txt, score = det
+                elif len(det) == 2:
                     box, (txt, score) = det
-                except Exception:
+                else:
                     continue
+        
                 txt = (txt or "").strip()
                 if not txt:
                     continue
