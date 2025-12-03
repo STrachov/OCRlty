@@ -1,4 +1,3 @@
-# lib/pipelines/tilt_client.py
 from __future__ import annotations
 
 import io
@@ -13,28 +12,6 @@ import tempfile
 
 logger = logging.getLogger(__name__)
 
-class PaddleOcrWrapper:
-    def __init__(self, min_confidence: float = 0.3) -> None:
-        self._ocr = None
-        self._ocr_err: Exception | None = None
-        self.min_confidence = min_confidence
-
-    # ленивый старт, чтобы /health работал даже без моделей
-    def _ensure_ocr(self) -> None:
-        if self._ocr is not None or self._ocr_err is not None:
-            return
-
-        try:
-            # В PaddleOCR 3.x PaddleX приезжает как зависимость.
-            from paddlex import create_pipeline  # type: ignore
-
-            # Берём общий пайплайн "OCR" (детекция + распознавание).
-            self._ocr = create_pipeline(pipeline="OCR")
-            logger.info("PaddleX OCR pipeline initialized")
-        except Exception as e:
-            self._ocr_err = e
-            logger.error("Failed to initialize PaddleX OCR: %r", e)
-
 # Опциональные тяжёлые зависимости: используем ленивый импорт
 try:  # Pillow для работы с изображениями
     from PIL import Image  # type: ignore[import]
@@ -46,16 +23,16 @@ try:  # PDF → изображения
 except Exception:  # pragma: no cover
     pdfium = None  # type: ignore[assignment]
 
-try:  # OCR (CPU)
-    from paddleocr import PaddleOCR  # type: ignore[import]
-except Exception:  # pragma: no cover
-    PaddleOCR = None  # type: ignore[assignment]
-
 try:
     import numpy as np  # type: ignore[import]
 except Exception:  # pragma: no cover
     np = None  # type: ignore[assignment]
 
+try:
+    # PaddleX 3.x: универсальный inference-пайплайн
+    from paddlex import create_pipeline  # type: ignore[import]
+except Exception:  # pragma: no cover
+    create_pipeline = None  # type: ignore[assignment]
 
 MOCK = os.getenv("MOCK_VLLM", "0") == "1"
 
@@ -128,7 +105,7 @@ class ArcticTiltClient:
 
     Делает три вещи:
       1. Превращает bytes (PDF/PNG/JPEG) → список PIL.Image.
-      2. Гоняет OCR по каждой странице (PaddleOCR, CPU) → слова + bbox.
+      2. Гоняет OCR по каждой странице (PaddleX/PaddleOCR, CPU) → слова + bbox.
       3. Формирует запрос /v1/tilt/generate и парсит JSON-ответ модели.
     """
 
@@ -142,6 +119,7 @@ class ArcticTiltClient:
         retry_backoff_s: float = 1.0,
         ocr_lang: str = "en",
         question: Optional[str] = None,
+        min_confidence: float = 0.3,
     ) -> None:
         self.base_url = _normalize_base_url(base_url)
         self.model = model
@@ -150,6 +128,7 @@ class ArcticTiltClient:
         self.max_retries = max_retries
         self.retry_backoff_s = retry_backoff_s
         self.ocr_lang = ocr_lang
+        self.min_confidence = min_confidence
 
         # Вопрос к TILT по умолчанию: извлечение реквизитов чека/квитанции в JSON.
         self.question = question or os.getenv(
@@ -188,32 +167,32 @@ class ArcticTiltClient:
             self._init_ocr()
 
     # ------------------------------------------------------------------ #
-    # Внутренние хелперы
+    # OCR init / ensure
     # ------------------------------------------------------------------ #
 
     def _init_ocr(self) -> None:
-        """Ленивый и безопасный init PaddleOCR."""
-        if PaddleOCR is None:
-            self._ocr_err = RuntimeError("paddleocr import failed (module not found)")
-            logger.error("PaddleOCR import failed: module not found")
-            return
-        if np is None:
-            self._ocr_err = RuntimeError("numpy is not installed")
-            logger.error("PaddleOCR init failed: numpy is not installed")
+        """Инициализация OCR-пайплайна (PaddleX)."""
+        if create_pipeline is None:
+            self._ocr_err = RuntimeError("paddlex is not installed")
+            logger.error("paddlex import failed: paddlex is not installed")
             return
         try:
-            self._ocr = PaddleOCR(
-                lang=self.ocr_lang,
-                use_angle_cls=True,  # только DeprecationWarning — это ок
-            )
-            logger.info("PaddleOCR initialized (lang=%s)", self.ocr_lang)
-        except Exception as exc:
-            # важно сохранить оригинальное исключение
+            # общий OCR-пайплайн: детекция + распознавание
+            self._ocr = create_pipeline(pipeline="OCR")
+            logger.info("PaddleX OCR pipeline initialized")
+        except Exception as exc:  # noqa: BLE001
             self._ocr_err = exc
-            logger.exception("PaddleOCR initialization failed")
+            logger.exception("Failed to initialize PaddleX OCR pipeline")
 
+    def _ensure_ocr(self) -> None:
+        """Гарантирует, что OCR инициализирован (или есть сохранённая ошибка)."""
+        if self._ocr is not None or self._ocr_err is not None:
+            return
+        self._init_ocr()
 
-    # ----- HTTP к tilt_api -----
+    # ------------------------------------------------------------------ #
+    # HTTP к tilt_api
+    # ------------------------------------------------------------------ #
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -266,7 +245,9 @@ class ArcticTiltClient:
             ) from last_exc
         raise RuntimeError(f"Unknown error calling {url}")
 
-    # ----- Bytes → изображения -----
+    # ------------------------------------------------------------------ #
+    # Bytes → изображения
+    # ------------------------------------------------------------------ #
 
     def _pdf_to_images(self, doc_bytes: bytes) -> List["Image.Image"]:
         if pdfium is None or Image is None:
@@ -283,8 +264,6 @@ class ArcticTiltClient:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"Failed to enumerate PDF pages: {exc}") from exc
 
-        # Для чеков обычно достаточно небольшого количества страниц,
-        # но если их много — можно будет позже ограничить.
         for i in page_indices:
             page = pdf[i]
             try:
@@ -324,24 +303,33 @@ class ArcticTiltClient:
 
         return images
 
-    def _doc_bytes_to_images(self, doc_bytes: bytes, content_type: Optional[str]) -> List["Image.Image"]:
+    def _doc_bytes_to_images(
+        self,
+        doc_bytes: bytes,
+        content_type: Optional[str],
+    ) -> List["Image.Image"]:
         if _is_pdf(doc_bytes, content_type):
             return self._pdf_to_images(doc_bytes)
         return self._image_bytes_to_images(doc_bytes)
 
-    # ----- OCR → TiltRequest.pages -----
+    # ------------------------------------------------------------------ #
+    # OCR → TiltRequest.pages
+    # ------------------------------------------------------------------ #
 
-    def _run_ocr(self, img: Image.Image) -> Tuple[int, int, List[Dict[str, Any]]]:
+    def _run_ocr(self, img: "Image.Image") -> Tuple[int, int, List[Dict[str, Any]]]:
         """
         Возвращает:
           - width, height картинки
           - список слов вида {"text": str, "bbox": [x1, y1, x2, y2], "score": float}
         """
         self._ensure_ocr()
-        if self._ocr_err is not None:
-            raise RuntimeError(f"PaddleOCR initialization failed: {self._ocr_err!r}")
+        if self._ocr_err is not None or self._ocr is None:
+            raise RuntimeError(f"OCR initialization failed: {self._ocr_err!r}")
 
-        # Приводим к RGB и сохраняем во временный файл — так точно совместимо
+        if Image is None:
+            raise RuntimeError("Pillow is required for OCR images")
+
+        # Приводим к RGB и сохраняем во временный файл — Paddlex понимает str и np.ndarray
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
 
@@ -352,13 +340,9 @@ class ArcticTiltClient:
         try:
             img.save(tmp_path, format="PNG")
 
-            # PaddleX pipeline: первый позиционный аргумент — input
-            try:
-                raw_out = self._ocr.predict([tmp_path])
-            except TypeError:
-                # на всякий случай — вдруг сигнатура только с именованным input
-                raw_out = self._ocr.predict(input=[tmp_path])
-
+            # PaddleX pipeline.predict возвращает генератор
+            raw_out_gen = self._ocr.predict(tmp_path)
+            raw_out = list(raw_out_gen)
         finally:
             try:
                 os.remove(tmp_path)
@@ -366,7 +350,7 @@ class ArcticTiltClient:
                 pass
 
         if not raw_out:
-            logger.warning("PaddleOCR returned empty output list")
+            logger.warning("PaddleOCR/PaddleX returned empty output list")
             return w, h, []
 
         page0 = raw_out[0]
@@ -378,29 +362,37 @@ class ArcticTiltClient:
             res = page0["res"]
         else:
             # крайне маловероятно, но на всякий случай логируем
-            logger.warning("Unexpected PaddleOCR output type: %r", type(page0))
+            logger.warning("Unexpected OCR output type: %r", type(page0))
             return w, h, []
 
         if hasattr(res, "__dict__") and not isinstance(res, dict):
             res = res.__dict__
 
         if not isinstance(res, dict):
-            logger.warning("PaddleOCR .res is not a dict: %r", type(res))
+            logger.warning("OCR .res is not a dict: %r", type(res))
             return w, h, []
 
-        # PaddleX 3.x: rec_boxes / rec_texts / rec_scores
-        boxes = res.get("rec_boxes") or res.get("dt_polys")
-        texts = res.get("rec_texts") or res.get("rec_text")
-        scores = res.get("rec_scores") or res.get("rec_score")
+        # PaddleX 3.x: часто используются эти ключи
+        boxes = (
+            res.get("rec_boxes")
+            or res.get("dt_polys")
+            or res.get("det_boxes")
+            or res.get("boxes")
+        )
+        texts = res.get("rec_texts") or res.get("rec_text") or res.get("texts")
+        scores = res.get("rec_scores") or res.get("rec_score") or res.get("scores")
 
         if boxes is None or texts is None:
-            logger.warning("PaddleOCR result has no boxes/texts keys: keys=%s", list(res.keys()))
+            logger.warning("OCR result has no boxes/texts keys: keys=%s", list(res.keys()))
             return w, h, []
 
-        # Приводим боксы к numpy для удобства
-        try:
-            boxes_arr = np.array(boxes)
-        except Exception:
+        # Приводим боксы к numpy для удобства (если есть numpy)
+        if np is not None:
+            try:
+                boxes_arr = np.array(boxes)
+            except Exception:
+                boxes_arr = boxes
+        else:
             boxes_arr = boxes
 
         out_words: List[Dict[str, Any]] = []
@@ -426,12 +418,15 @@ class ArcticTiltClient:
 
             try:
                 if hasattr(box, "shape") and len(box.shape) == 2:
+                    # polygon: [[x1,y1], [x2,y2], ...]
                     xs = box[:, 0]
                     ys = box[:, 1]
                     x1, y1, x2, y2 = float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
                 elif len(box) == 4:
+                    # уже [x1, y1, x2, y2]
                     x1, y1, x2, y2 = map(float, box)
                 else:
+                    # возможно список из 8 координат [x1,y1,x2,y2,...]
                     xs = box[0::2]
                     ys = box[1::2]
                     x1, y1, x2, y2 = float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))
@@ -443,10 +438,12 @@ class ArcticTiltClient:
                 {"text": str(text), "bbox": [x1, y1, x2, y2], "score": score}
             )
 
-        logger.info("PaddleOCR returned %d words (after filtering)", len(out_words))
+        logger.info("OCR returned %d words (after filtering)", len(out_words))
         return w, h, out_words
 
-    # ----- парсинг ответа модели -----
+    # ------------------------------------------------------------------ #
+    # Парсинг ответа модели
+    # ------------------------------------------------------------------ #
 
     def _parse_response(self, content: str) -> Dict[str, Any]:
         return _extract_json_from_text(content)
@@ -489,12 +486,12 @@ class ArcticTiltClient:
                 logger.debug(
                     "TILT client OCR: page %d, first 5 words: %s",
                     page_idx,
-                    [w["text"] for w in words[:5]],
+                    [w_["text"] for w_ in words[:5]],
                 )
             ocr_page = {
                 "width": int(w),
                 "height": int(h),
-                "words": words,
+                "words": [{"text": w_["text"], "bbox": w_["bbox"]} for w_ in words],
             }
             pages_payload.append({"ocr": ocr_page})
 
@@ -519,7 +516,9 @@ class ArcticTiltClient:
         try:
             content = resp["choices"][0]["message"]["content"]
         except Exception as e:  # noqa: BLE001
-            raise RuntimeError(f"Unexpected tilt_api response structure: {e}; got: {resp}") from e
+            raise RuntimeError(
+                f"Unexpected tilt_api response structure: {e}; got: {resp}"
+            ) from e
 
         return self._parse_response(content)
 
