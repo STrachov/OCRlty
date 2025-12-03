@@ -131,31 +131,45 @@ class ArcticTiltClient:
         self.min_confidence = min_confidence
        
         RECEIPT_PROMPT_1 = """You are an information extraction engine for receipts.
-
 Given the OCR words with bounding boxes for a single page,
 extract the following fields from the receipt:
-
 - seller_name: the business or store name (usually at the top of the receipt, not "SALES RECEIPT").
 - invoice_date: the date of the purchase (usually near the bottom).
-- currency: the currency code or symbol (e.g. GBP, EUR, $, £).
 - total_discount: the final total of all discounts applied to this receipt.
 - total_amount: the final amount the customer must pay after all discounts.
 - items: a list of purchased products or services from the body of the receipt.
-
 You MUST answer by filling this JSON template.
 Replace null values with the extracted values when possible.
 Use null if a field is missing or unclear.
 Output JSON only, with no extra text.
-
 {
   "seller_name": null,
   "invoice_date": null,
-  "currency": null,
   "total_discount": null,
   "total_amount": null,
   "items": []
 }
 """
+        RECEIPT_PROMPT_1_2 = """You are an information extraction engine for receipts.
+
+From the OCR words with bounding boxes of a single receipt,
+extract the following fields:
+
+- seller_name: business or store name (top of the receipt, not "SALES RECEIPT").
+- invoice_date: date of purchase (DD/MM/YYYY or YYYY-MM-DD).
+- total_discount: final total of all discounts.
+- total_amount: final amount the customer must pay after all discounts.
+
+Answer in EXACTLY 4 lines, in this exact format:
+
+seller_name=<value or null>
+invoice_date=<value or null>
+total_discount=<number or null>
+total_amount=<number or null>
+
+Do not add any other text, explanations or JSON.
+"""
+
         RECEIPT_PROMPT_2 = """You are an information extraction engine for receipts.
 
 From the OCR words of this receipt, find the FINAL total amount
@@ -173,7 +187,7 @@ Output JSON only. """
         # Вопрос к TILT по умолчанию: извлечение реквизитов чека/квитанции в JSON.
         self.question = question or os.getenv(
             "TILT_KIE_PROMPT",
-            RECEIPT_PROMPT_1,
+            RECEIPT_PROMPT_1_2,
         )
         logger.info("TILT KIE question (first 200 chars): %r", self.question)
 
