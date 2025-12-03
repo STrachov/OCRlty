@@ -129,35 +129,53 @@ class ArcticTiltClient:
         self.retry_backoff_s = retry_backoff_s
         self.ocr_lang = ocr_lang
         self.min_confidence = min_confidence
+       
+        RECEIPT_PROMPT_1 = """You are an information extraction engine for receipts and invoices.
 
-        olf_question = ("You are an information extraction engine for receipts and invoices. "
-                "Given the OCR words with bounding boxes of a single document page, "
-                "extract key fields and return ONLY a valid JSON object with the "
-                "following structure (use null when value is missing):\n"
-                "{"
-                "\"seller_name\": str | null,"
-                "\"seller_address\": str | null,"
-                "\"seller_vat_id\": str | null,"
-                "\"invoice_number\": str | null,"
-                "\"invoice_date\": str | null,"
-                "\"currency\": str | null,"
-                "\"subtotal\": float | null,"
-                "\"tax_amount\": float | null,"
-                "\"total_amount\": float | null,"
-                "\"items\": ["
-                "{\"description\": str, \"quantity\": float | null, \"unit_price\": float | null, \"line_total\": float | null}"
-                "]"
-                "}.\n"
-                "Do not add explanations or extra text, output JSON only.")
+Given the OCR words with bounding boxes for a single page,
+fill the following JSON object with values from the document.
+Use null if a field is missing. Output JSON only, no extra text.
+
+JSON template:
+
+{
+  "seller_name": null,
+  "seller_address": null,
+  "seller_vat_id": null,
+  "invoice_number": null,
+  "invoice_date": null,
+  "currency": null,
+  "subtotal": null,
+  "tax_amount": null,
+  "total_amount": null,
+  "items": []
+}
+
+Rules:
+- "seller_name" is the business or store name (not "SALES RECEIPT").
+- "invoice_number" is the receipt or invoice number near the bottom.
+- "invoice_date" is the date of the purchase.
+- "total_amount" is the final amount the customer must pay after all discounts.
+- "items" is a list of purchased products or services on the receipt body.
+"""
+        RECEIPT_PROMPT_2 = """You are an information extraction engine for receipts.
+
+From the OCR words of this receipt, find the FINAL total amount
+that the customer must pay AFTER all discounts.
+It is usually labeled "Total:" near the bottom above the payment method.
+
+Answer with a single JSON object:
+{"total_amount": <number>}
+
+Use a dot as decimal separator. Do not include currency symbols.
+Output JSON only. """
+
+
 
         # Вопрос к TILT по умолчанию: извлечение реквизитов чека/квитанции в JSON.
         self.question = question or os.getenv(
             "TILT_KIE_PROMPT",
-            (
-                "You are an information extraction engine for receipts and invoices. "
-                "Given the OCR words with bounding boxes of a single document page, "
-                "extract total amount only and present it as number only."
-            ),
+            RECEIPT_PROMPT_2,
         )
         logger.info("TILT KIE question (first 200 chars): %r", self.question)
 
