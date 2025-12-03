@@ -130,11 +130,7 @@ class ArcticTiltClient:
         self.ocr_lang = ocr_lang
         self.min_confidence = min_confidence
 
-        # Вопрос к TILT по умолчанию: извлечение реквизитов чека/квитанции в JSON.
-        self.question = question or os.getenv(
-            "TILT_KIE_PROMPT",
-            (
-                "You are an information extraction engine for receipts and invoices. "
+        olf_question = ("You are an information extraction engine for receipts and invoices. "
                 "Given the OCR words with bounding boxes of a single document page, "
                 "extract key fields and return ONLY a valid JSON object with the "
                 "following structure (use null when value is missing):\n"
@@ -152,7 +148,15 @@ class ArcticTiltClient:
                 "{\"description\": str, \"quantity\": float | null, \"unit_price\": float | null, \"line_total\": float | null}"
                 "]"
                 "}.\n"
-                "Do not add explanations or extra text, output JSON only."
+                "Do not add explanations or extra text, output JSON only.")
+
+        # Вопрос к TILT по умолчанию: извлечение реквизитов чека/квитанции в JSON.
+        self.question = question or os.getenv(
+            "TILT_KIE_PROMPT",
+            (
+                "You are an information extraction engine for receipts and invoices. "
+                "Given the OCR words with bounding boxes of a single document page, "
+                "extract total amount only and present it as number only."
             ),
         )
         logger.info("TILT KIE question (first 200 chars): %r", self.question)
