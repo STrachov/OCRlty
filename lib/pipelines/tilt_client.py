@@ -155,6 +155,7 @@ class ArcticTiltClient:
                 "Do not add explanations or extra text, output JSON only."
             ),
         )
+        logger.info("TILT KIE question (first 200 chars): %r", self.question[:200])
 
         # HTTP-клиент к tilt_api
         self._cli = httpx.Client(timeout=self.timeout)
