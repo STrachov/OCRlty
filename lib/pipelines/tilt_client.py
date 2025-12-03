@@ -130,31 +130,23 @@ class ArcticTiltClient:
         self.ocr_lang = ocr_lang
         self.min_confidence = min_confidence
        
-        RECEIPT_PROMPT_1 = """You are an information extraction engine for receipts and invoices.
-
+        RECEIPT_PROMPT_1 = """You are an information extraction engine for receipts.
 Given the OCR words with bounding boxes for a single page,
 fill the following JSON object with values from the document.
 Use null if a field is missing. Output JSON only, no extra text.
-
 JSON template:
-
 {
   "seller_name": null,
-  "seller_address": null,
-  "seller_vat_id": null,
-  "invoice_number": null,
   "invoice_date": null,
   "currency": null,
-  "subtotal": null,
-  "tax_amount": null,
+  "total_discount": null,
   "total_amount": null,
   "items": []
 }
-
 Rules:
-- "seller_name" is the business or store name (not "SALES RECEIPT").
-- "invoice_number" is the receipt or invoice number near the bottom.
-- "invoice_date" is the date of the purchase.
+- "seller_name" is the business or store name (usually at the top of the reciept but not "SALES RECEIPT").
+- "invoice_date" is the date of the purchase (usually at the bottom of the reciept).
+- "total_discount" is the final amount of all discounts.
 - "total_amount" is the final amount the customer must pay after all discounts.
 - "items" is a list of purchased products or services on the receipt body.
 """
