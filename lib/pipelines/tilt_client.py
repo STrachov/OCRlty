@@ -539,6 +539,7 @@ class ArcticTiltClient:
         )
 
         resp = self._post_tilt(payload)
+        print(f'[infer] resp={resp}')
 
         try:
             content = resp["choices"][0]["message"]["content"]
