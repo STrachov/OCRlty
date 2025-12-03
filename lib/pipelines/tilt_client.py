@@ -175,7 +175,7 @@ Output JSON only. """
         # Вопрос к TILT по умолчанию: извлечение реквизитов чека/квитанции в JSON.
         self.question = question or os.getenv(
             "TILT_KIE_PROMPT",
-            RECEIPT_PROMPT_2,
+            RECEIPT_PROMPT_1,
         )
         logger.info("TILT KIE question (first 200 chars): %r", self.question)
 
