@@ -525,6 +525,7 @@ class ArcticTiltClient:
         if not total_words:
             # Чтобы не выстрелить TILT'у по пустому
             raise RuntimeError("OCR produced zero words on all pages")
+        print(f'[infer] pages_payload={pages_payload}')
 
         payload: Dict[str, Any] = {
             "question": self.question,
