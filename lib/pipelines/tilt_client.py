@@ -354,19 +354,28 @@ class ArcticTiltClient:
             return w, h, []
 
         page0 = raw_out[0]
-
-        # У разных версий это или объект с .res, или dict с ключом "res"
+        
+        # У разных версий PaddleX/PaddleOCR это может быть:
+        # - объект с атрибутом .res;
+        # - dict с ключом "res";
+        # - собственный объект результата (например, paddlex.inference.pipelines.ocr.result.OCRResult).
+        # В последнем случае пробуем использовать сам объект как результат, не отбрасывая его.
         if hasattr(page0, "res"):
             res = page0.res
         elif isinstance(page0, dict) and "res" in page0:
             res = page0["res"]
         else:
-            # крайне маловероятно, но на всякий случай логируем
-            logger.warning("Unexpected OCR output type: %r", type(page0))
-            return w, h, []
-
+            logger.warning(
+                "Unexpected OCR output type: %r; using object itself as result",
+                type(page0),
+            )
+            res = page0
+        
+        # На этом этапе res может быть как dict, так и dataclass/объект.
+        # Для объектов без прямого dict-интерфейса разворачиваем __dict__.
         if hasattr(res, "__dict__") and not isinstance(res, dict):
             res = res.__dict__
+
 
         if not isinstance(res, dict):
             logger.warning("OCR .res is not a dict: %r", type(res))

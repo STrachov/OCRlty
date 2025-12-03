@@ -49,6 +49,7 @@ curl -X POST "http://127.0.0.1:8001/v1/tilt/generate" \
 ## 3) Репозиторий (структура)
 ├─ apps/
 │ ├─ api_gpu/ # FastAPI + inference 
+│ │    └─ main.py 
 │ └─ tilt_api.py/ # FastAPI + vLLM + Arctic-TILT
 ├─ configs/ # yaml/json конфиги моделей/правил/локалей
 ├─ docs/ # OpenAPI-export, примеры, диаграммы, SLA
@@ -76,8 +77,8 @@ curl -X POST "http://127.0.0.1:8001/v1/tilt/generate" \
 
 ---
 
-## 4) Версии и зависимости
-### 4.1 CPU-стек (API + OCR) → `requirements-cpu.txt`
+## 4) Версии и зависимости `requirements-gpu.txt`
+### 4.1 CPU-стек (API + OCR) 
 - **PaddleOCR 3.x**: `paddleocr>=3.2,<4.0`
 - **PaddlePaddle (CPU)**: `paddlepaddle==3.1.0`
 - (опц.) **ONNX Runtime**: `onnxruntime==1.18.1` (ускорение через HPI)
@@ -86,7 +87,7 @@ curl -X POST "http://127.0.0.1:8001/v1/tilt/generate" \
 - API: `fastapi>=0.110, `python-multipart>=0.0.9``, `uvicorn[standard]>=0.27`, `pydantic>=2.5`, `httpx>=0.27`, `loguru>=0.7`
 - Базовые: `numpy>=1.25,<3`
 
-### 4.2 GPU-стек (vLLM + TILT) → `requirements-gpu.txt`
+### 4.2 GPU-стек (vLLM + TILT) →
 - **vLLM**: `vllm==0.8.3`
 - HF-экосистема: `huggingface_hub>=0.23`, `tokenizers>=0.15,<0.20`, `tiktoken>=0.6`, `sentencepiece>=0.1.99`
 - (опц.) Torch под CUDA образ (если требуется конкретной сборкой).
