@@ -318,7 +318,7 @@ class ArcticTiltClient:
 
     def _run_ocr(self, img: "Image.Image") -> Tuple[int, int, List[Dict[str, Any]]]:
         """
-        Возвращает:
+        Запускает PaddleX OCR для одного изображения и возвращает:
           - width, height картинки
           - список слов вида {"text": str, "bbox": [x1, y1, x2, y2], "score": float}
         """
@@ -329,24 +329,24 @@ class ArcticTiltClient:
         if Image is None:
             raise RuntimeError("Pillow is required for OCR images")
 
-        # Приводим к RGB и сохраняем во временный файл — Paddlex понимает str и np.ndarray
+        # Приводим к приемлемому формату
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
 
         w, h = img.size
 
+        # PaddleX принимает путь к файлу или np.ndarray.
+        # Используем временный PNG — самый простой и стабильный вариант.
         fd, tmp_path = tempfile.mkstemp(suffix=".png")
         os.close(fd)
         try:
             img.save(tmp_path, format="PNG")
-
-            # PaddleX pipeline.predict возвращает генератор
             raw_out_gen = self._ocr.predict(tmp_path)
             raw_out = list(raw_out_gen)
         finally:
             try:
                 os.remove(tmp_path)
-            except OSError:
+            except Exception:  # noqa: BLE001
                 pass
 
         if not raw_out:
@@ -354,12 +354,11 @@ class ArcticTiltClient:
             return w, h, []
 
         page0 = raw_out[0]
-        
-        # У разных версий PaddleX/PaddleOCR это может быть:
-        # - объект с атрибутом .res;
-        # - dict с ключом "res";
-        # - собственный объект результата (например, paddlex.inference.pipelines.ocr.result.OCRResult).
-        # В последнем случае пробуем использовать сам объект как результат, не отбрасывая его.
+
+        # В разных версиях PaddleX:
+        #   - page0.res — объект с полем res
+        #   - {"res": ...} — словарь
+        #   - OCRResult — объект результата без явного поля res
         if hasattr(page0, "res"):
             res = page0.res
         elif isinstance(page0, dict) and "res" in page0:
@@ -370,26 +369,41 @@ class ArcticTiltClient:
                 type(page0),
             )
             res = page0
-        
-        # На этом этапе res может быть как dict, так и dataclass/объект.
-        # Для объектов без прямого dict-интерфейса разворачиваем __dict__.
+
+        # Если res — не dict, но обычный объект, пробуем взять его __dict__
         if hasattr(res, "__dict__") and not isinstance(res, dict):
             res = res.__dict__
 
-
         if not isinstance(res, dict):
-            logger.warning("OCR .res is not a dict: %r", type(res))
+            logger.warning("OCR .res is not a dict-like object: %r", type(res))
             return w, h, []
 
-        # PaddleX 3.x: часто используются эти ключи
-        boxes = (
-            res.get("rec_boxes")
-            or res.get("dt_polys")
-            or res.get("det_boxes")
-            or res.get("boxes")
-        )
-        texts = res.get("rec_texts") or res.get("rec_text") or res.get("texts")
-        scores = res.get("rec_scores") or res.get("rec_score") or res.get("scores")
+        def _first_nonempty(keys: Tuple[str, ...]):
+            """Аккуратно берём первое непустое значение без bool(np.array)."""
+            for key in keys:
+                if key not in res:
+                    continue
+                val = res[key]
+                if val is None:
+                    continue
+                try:
+                    # Пустые списки / строки / numpy-массивы считаем "пустыми"
+                    if np is not None and isinstance(val, np.ndarray):
+                        if val.size == 0:
+                            continue
+                    elif isinstance(val, (list, tuple, str)):
+                        if len(val) == 0:
+                            continue
+                except Exception:
+                    # На всякий случай ничего не ломаем
+                    pass
+                return val
+            return None
+
+        # PaddleX 3.x: чаще всего используются эти ключи
+        boxes = _first_nonempty(("rec_boxes", "dt_polys", "det_boxes", "boxes"))
+        texts = _first_nonempty(("rec_texts", "rec_text", "texts"))
+        scores = _first_nonempty(("rec_scores", "rec_score", "scores"))
 
         if boxes is None or texts is None:
             logger.warning("OCR result has no boxes/texts keys: keys=%s", list(res.keys()))
@@ -399,7 +413,7 @@ class ArcticTiltClient:
         if np is not None:
             try:
                 boxes_arr = np.array(boxes)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 boxes_arr = boxes
         else:
             boxes_arr = boxes
@@ -409,45 +423,49 @@ class ArcticTiltClient:
         for idx, (box, text) in enumerate(zip(boxes_arr, texts)):
             if not text:
                 continue
+
             score = 1.0
             if scores is not None and idx < len(scores):
                 try:
                     score = float(scores[idx])
-                except Exception:
+                except Exception:  # noqa: BLE001
                     pass
 
             if score < self.min_confidence:
                 continue
 
-            # box может быть:
-            # - [x1, y1, x2, y2] (rec_boxes)
-            # - [4, 2] массив полигона (dt_polys)
-            # - список из 8 координат
-            x1 = y1 = x2 = y2 = 0.0
-
+            # Нормализуем bbox к [x1, y1, x2, y2]
             try:
-                if hasattr(box, "shape") and len(box.shape) == 2:
-                    # polygon: [[x1,y1], [x2,y2], ...]
-                    xs = box[:, 0]
-                    ys = box[:, 1]
-                    x1, y1, x2, y2 = float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
-                elif len(box) == 4:
-                    # уже [x1, y1, x2, y2]
-                    x1, y1, x2, y2 = map(float, box)
+                if np is not None and isinstance(box, np.ndarray):
+                    pts = box.reshape(-1, 2)
+                    x1 = float(pts[:, 0].min())
+                    y1 = float(pts[:, 1].min())
+                    x2 = float(pts[:, 0].max())
+                    y2 = float(pts[:, 1].max())
                 else:
-                    # возможно список из 8 координат [x1,y1,x2,y2,...]
-                    xs = box[0::2]
-                    ys = box[1::2]
-                    x1, y1, x2, y2 = float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))
-            except Exception:
-                logger.debug("Failed to parse box #%d: %r", idx, box)
+                    # Может быть список из 4 чисел или список точек [[x, y], ...]
+                    if (
+                        isinstance(box, (list, tuple))
+                        and len(box) == 4
+                        and all(isinstance(v, (int, float)) for v in box)
+                    ):
+                        x1, y1, x2, y2 = map(float, box)
+                    else:
+                        pts = list(box)
+                        xs = [float(p[0]) for p in pts]
+                        ys = [float(p[1]) for p in pts]
+                        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+            except Exception:  # noqa: BLE001
+                logger.debug("Failed to normalize OCR box #%d: %r", idx, box, exc_info=True)
                 continue
 
             out_words.append(
-                {"text": str(text), "bbox": [x1, y1, x2, y2], "score": score}
+                {
+                    "text": str(text),
+                    "bbox": [x1, y1, x2, y2],
+                    "score": float(score),
+                }
             )
-
-        logger.info("OCR returned %d words (after filtering)", len(out_words))
         return w, h, out_words
 
     # ------------------------------------------------------------------ #
