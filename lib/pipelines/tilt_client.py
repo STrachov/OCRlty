@@ -57,7 +57,7 @@ def _extract_json_from_text(text: str) -> Dict[str, Any]:
     text = text.strip()
     if not text:
         raise ValueError("Empty response from model")
-
+    print(f'[_extract_json_from_text] text=:{text}')
     # 1) чистый JSON-объект
     if text.startswith("{") and text.endswith("}"):
         return json.loads(text)
