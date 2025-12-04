@@ -24,5 +24,10 @@ curl -X POST "http://127.0.0.1:8001/v1/tilt/generate" \
 
 curl -X POST "http://127.0.0.1:8000/v1/extract" \
   -H "Accept: application/json" \
-  -F "file=@/workspace/src/tests/reciept_1.png;type=image/png"
+  -F "file=@/workspace/src/tests/reciept_1.png;type=image/png" \
+  -F 'question=You see the OCR words and positions from a sales receipt.
+
+Find the line with the cash and read the amount written next to it.
+
+Answer with that amount exactly as it is printed on the receipt, including any minus sign and currency symbol, and nothing else.'
 
