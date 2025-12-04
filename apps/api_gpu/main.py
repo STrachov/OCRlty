@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 
 from lib.pipelines.tilt_client import ArcticTiltClient
@@ -134,7 +134,10 @@ def health() -> Dict[str, Any]:
 
 
 @app.post("/v1/extract", tags=["inference"])
-async def extract(file: UploadFile = File(...), question: Optional[str] = None) -> Dict[str, Any]:
+async def extract(
+    file: UploadFile = File(...), 
+    question: Optional[str] = Form(None),
+) -> Dict[str, Any]:
     if tilt is None:
         raise HTTPException(status_code=503, detail="Model client not initialized")
 
