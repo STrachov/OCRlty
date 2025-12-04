@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import uuid
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from contextlib import asynccontextmanager
 
 import httpx
@@ -134,7 +134,7 @@ def health() -> Dict[str, Any]:
 
 
 @app.post("/v1/extract", tags=["inference"])
-async def extract(file: UploadFile = File(...)) -> Dict[str, Any]:
+async def extract(file: UploadFile = File(...), question: Optional[str] = None) -> Dict[str, Any]:
     if tilt is None:
         raise HTTPException(status_code=503, detail="Model client not initialized")
 
@@ -166,7 +166,7 @@ async def extract(file: UploadFile = File(...)) -> Dict[str, Any]:
 
     try:
         # важно передать content_type, чтобы корректно определить PDF vs image
-        fields = tilt.infer(content, content_type=file.content_type or None)
+        fields = tilt.infer(content, content_type=file.content_type or None, question=question)
     except Exception as e:  # noqa: BLE001
         log.exception("TILT inference failed for request %s: %s", request_id, e)
         raise HTTPException(status_code=500, detail=f"TILT inference failed: {e}") from e

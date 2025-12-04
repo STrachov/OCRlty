@@ -514,11 +514,12 @@ Output JSON only. """
     # Публичный API
     # ------------------------------------------------------------------ #
 
-    def infer(self, doc_bytes: bytes, content_type: Optional[str] = None) -> Dict[str, Any]:
+    def infer(self, doc_bytes: bytes, content_type: Optional[str] = None, question: Optional[str] = None) -> Dict[str, Any]:
         """Основной метод: bytes документа → dict с извлечёнными полями.
 
         :param doc_bytes: содержимое загруженного файла (PDF/JPEG/PNG)
         :param content_type: MIME-тип (для PDF более надёжное определение)
+        :param question: вопрос к TILT
         """
         if MOCK:
             # Упрощённый дубль для локальной отладки без TILT'а
@@ -563,7 +564,7 @@ Output JSON only. """
         print(f'[infer] pages_payload={pages_payload}')
 
         payload: Dict[str, Any] = {
-            "question": self.question,
+            "question": question or self.question,
             "pages": pages_payload,
             "model": self.model,
         }
