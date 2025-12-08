@@ -1,10 +1,14 @@
 #!/usr/bin/env python
 from __future__ import annotations
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]  # /workspace/src
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import argparse
 import json
 import logging
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from lib.pipelines.tilt_client import ArcticTiltClient
