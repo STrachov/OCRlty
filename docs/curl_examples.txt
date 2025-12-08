@@ -24,10 +24,57 @@ curl -X POST "http://127.0.0.1:8001/v1/tilt/generate" \
 
 curl -X POST "http://127.0.0.1:8000/v1/extract" \
   -H "Accept: application/json" \
-  -F "file=@/workspace/src/tests/reciept_1.png;type=image/png" \
+  -F "file=@/workspace/src/tests/cord_train/receipt_00491.png;type=image/png" \
   -F 'question=You see the OCR words and positions from a sales receipt.
 
 Find the line with the cash and read the amount written next to it.
 
 Answer with that amount exactly as it is printed on the receipt, including any minus sign and currency symbol, and nothing else.'
 
+
+
+You see the OCR words and positions from a sales receipt.
+
+Find all line items (products) that the customer bought.
+On this type of receipt they are in the table above the summary lines
+like "Total", "Cash", "Change".
+
+For each product, read:
+- the quantity,
+- the item name,
+- the line price on the right.
+
+For example:  
+1 Double Espresso     8,0
+means: quantity = 1, item name = Double Espresso, price=8,0
+
+List all item names from the receipt'
+
+
+You see the OCR words and positions from a sales receipt.
+
+Find the line with the cash and read the amount written next to it.
+
+Answer with that amount exactly as it is printed on the receipt, including any minus sign and currency symbol, and nothing else.
+
+
+
+
+You see the OCR words and positions from a sales receipt.
+
+Find all line items (products) that the customer bought.
+On this type of receipt they are in the table under the header
+"Qty  Item Description  Price" and above the summary lines
+like "Items Sold", "Sub Total", "Discount Total", "Total", "Cash", "Change".
+
+For each product, read:
+- the quantity,
+- the item name,
+- the line price on the right.
+
+Answer with one line per product in this exact format:
+
+QTY  ITEM_NAME  PRICE
+
+Use the text exactly as it is printed on the receipt.
+Do not include any other text before or after the list.
