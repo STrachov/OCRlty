@@ -61,10 +61,12 @@ class EvalTiltClient(ArcticTiltClient):
 def load_gt(gt_path: Path) -> List[Dict[str, Any]]:
     with gt_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
-    if not isinstance(data, list):
-        raise ValueError(f"Expected list in {gt_path}, got {type(data)}")
-    return data
-
+        records: List[Dict[str, Any]] = []
+        for k, v in data.items():
+            rec = dict(v)
+            rec.setdefault("id", k)
+            records.append(rec)
+        return records
 
 def main() -> None:
     parser = argparse.ArgumentParser(
