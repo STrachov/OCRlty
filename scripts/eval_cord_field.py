@@ -2,9 +2,13 @@
 from __future__ import annotations
 import sys
 from pathlib import Path
-ROOT = Path(__file__).resolve().parents[1]  # /workspace/src
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+
+ROOT = Path(__file__).resolve().parents[1]      # /workspace/src
+LIB_ROOT = ROOT / "lib"                         # /workspace/src/lib
+
+for p in (str(LIB_ROOT), str(ROOT)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 import argparse
 import json
@@ -30,7 +34,7 @@ LIMIT_SAMPLES: Optional[int] = None                 # можно постави�
 
 log = logging.getLogger("eval_cord_field")
 
-
+log.info(f"ROOT: {ROOT}")
 def guess_content_type(path: Path) -> str:
     ext = path.suffix.lower()
     if ext in {".jpg", ".jpeg"}:

@@ -78,3 +78,13 @@ QTY  ITEM_NAME  PRICE
 
 Use the text exactly as it is printed on the receipt.
 Do not include any other text before or after the list.
+
+
+
+python scripts/eval_cord_field.py \
+  --field total_price \
+  --prompt "You see the OCR words and positions from a sales receipt.
+
+Find the final total amount the customer must pay (after all discounts and taxes).
+Answer with that amount exactly as it is printed on the receipt, including currency symbol if any, and nothing else."
+
