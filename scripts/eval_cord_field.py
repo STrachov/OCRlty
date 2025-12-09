@@ -15,8 +15,8 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from lib.pipelines.tilt_client import ArcticTiltClient
-from lib.utils.parsing import parse_number, numbers_close
+from pipelines.tilt_client import ArcticTiltClient
+from utils.parsing import parse_number, numbers_close
 
 
 # ---- Константы окружения для твоего проекта ---- #
