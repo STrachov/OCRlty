@@ -376,7 +376,10 @@ Output JSON only. """
         os.close(fd)
         try:
             img.save(tmp_path, format="PNG")
-            raw_out_gen = self._ocr.predict(tmp_path)
+            raw_out_gen = self._ocr.predict(
+                tmp_path,
+                use_doc_orientation_classify=False,
+                )
             raw_out = list(raw_out_gen)
         finally:
             try:

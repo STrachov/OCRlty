@@ -43,11 +43,13 @@ MAX_SAMPLES = 0  # 0 = без лимита
 
 # OCR
 MIN_CONFIDENCE = 0.0  # выставь 0.3 если хочешь как в tilt_client по умолчанию
+DETECT_AND_ROTATE = False
 
 # Визуализация
-SAVE_OVERLAY = True
-SAVE_WHITE_OVERLAY = False
-SAVE_TILT_LIKE = True
+SAVE_OVERLAY = False          # оверлей поверх оригинала
+SAVE_WHITE_OVERLAY = False    # только белый фон
+SAVE_TILT_LIKE = False        # «кроп» по области детектов
+SAVE_SIDE_BY_SIDE = True      # слева чек, справа белый фон с текстами
 
 # Если хочешь прогонять только проблемные кейсы:
 ONLY_MISMATCHES = True
@@ -144,7 +146,7 @@ def resolve_image_path(raw: Optional[str]) -> Optional[Path]:
 
 
 # -------------------------
-# PaddleX OCR как в tilt_client
+# PaddleX OCR как в tilt_client + фиксы ориентации
 # -------------------------
 
 def _first_nonempty(res: Dict[str, Any], keys: Tuple[str, ...]):
@@ -168,40 +170,327 @@ def _first_nonempty(res: Dict[str, Any], keys: Tuple[str, ...]):
     return None
 
 
+def compute_bbox_from_points(box) -> Optional[Tuple[float, float, float, float]]:
+    """
+    box: список/массив точек [[x,y], ...]
+    -> (x1, y1, x2, y2)
+    """
+    try:
+        pts = list(box)
+        if not pts:
+            return None
+
+        xs: List[float] = []
+        ys: List[float] = []
+
+        for p in pts:
+            if not hasattr(p, "__len__") or len(p) < 2:
+                continue
+            xs.append(float(p[0]))
+            ys.append(float(p[1]))
+
+        if not xs or not ys:
+            return None
+
+        return min(xs), min(ys), max(xs), max(ys)
+    except Exception:
+        return None
+
+
+def detect_vertical_page(
+    raw_boxes,
+    raw_texts,
+    min_chars: int = 4,
+    aspect_thresh: float = 2.2,
+    min_samples: int = 5,
+    fraction_thresh: float = 0.6,
+) -> bool:
+    """
+    Возвращает True, если страница выглядит "вертикально сломанной":
+    у большинства длинных слов сильно вытянутые по вертикали боксы (h >> w).
+    """
+
+    ratios: List[float] = []
+
+    for box, text in zip(raw_boxes, raw_texts):
+        if not text:
+            continue
+
+        clean = str(text).replace(" ", "")
+        if len(clean) < min_chars:
+            # по коротким токенам не судим об ориентации
+            continue
+
+        bbox = compute_bbox_from_points(box)
+        if bbox is None:
+            continue
+        x1, y1, x2, y2 = bbox
+        w = x2 - x1
+        h = y2 - y1
+        if w <= 0 or h <= 0:
+            continue
+
+        ratios.append(h / w)
+
+    if len(ratios) < min_samples:
+        # мало данных – ничего не трогаем
+        return False
+
+    ratios.sort()
+    median = ratios[len(ratios) // 2]
+    frac = sum(r > aspect_thresh for r in ratios) / len(ratios)
+
+    return median > aspect_thresh and frac > fraction_thresh
+
+
+def fix_box_on_vertical_page(
+    bbox: List[float],
+    img_w: int,
+    img_h: int,
+    shallow_factor: float = 1.1,
+) -> List[float]:
+    """
+    Для страницы, признанной вертикально сломанной:
+    локально "переворачиваем" бокс: меняем ширину и высоту вокруг центра,
+    если он заметно выше, чем шире.
+
+    bbox: [x1, y1, x2, y2] в координатах картинки.
+    """
+
+    x1, y1, x2, y2 = bbox
+    w = x2 - x1
+    h = y2 - y1
+    if w <= 0 or h <= 0:
+        return bbox
+
+    # если бокс уже почти горизонтальный – не трогаем
+    if h <= w * shallow_factor:
+        return bbox
+
+    # центр
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+
+    # "переворачиваем": новая ширина = старая высота, новая высота = старая ширина
+    new_w = h
+    new_h = w
+
+    x1 = cx - new_w / 2.0
+    x2 = cx + new_w / 2.0
+    y1 = cy - new_h / 2.0
+    y2 = cy + new_h / 2.0
+
+    # клип в пределах изображения
+    x1 = max(0.0, min(float(img_w - 1), x1))
+    x2 = max(0.0, min(float(img_w - 1), x2))
+    y1 = max(0.0, min(float(img_h - 1), y1))
+    y2 = max(0.0, min(float(img_h - 1), y2))
+
+    return [float(x1), float(y1), float(x2), float(y2)]
+
+# New funcctional
+def compute_bbox_from_points(box) -> Optional[Tuple[float, float, float, float]]:
+    """
+    box: список/массив точек [[x,y], ...]
+    -> (x1, y1, x2, y2)`
+    """
+    try:
+        pts = list(box)
+        if not pts:
+            return None
+
+        xs: List[float] = []
+        ys: List[float] = []
+
+        for p in pts:
+            if not hasattr(p, "__len__") or len(p) < 2:
+                continue
+            xs.append(float(p[0]))
+            ys.append(float(p[1]))
+
+        if not xs or not ys:
+            return None
+
+        return min(xs), min(ys), max(xs), max(ys)
+    except Exception:
+        return None
+
+
+def transform_box_points(box, img_w: int, img_h: int, orient: str) -> List[List[float]]:
+    """
+    Преобразует точки бокса из координат Paddle в координаты оригинального изображения
+    с учётом ориентации:
+
+      orient = "none"  — ничего не делаем
+      orient = "cw"    — Paddle работал с изображением, повернутым
+                         на 90° по часовой; разворачиваем обратно
+      orient = "ccw"   — Paddle работал с изображением, повернутым
+                         против часовой
+
+    Все формулы — для преобразования (x_paddle, y_paddle) -> (x_orig, y_orig).
+    """
+
+    pts = list(box)
+    out: List[List[float]] = []
+
+    for p in pts:
+        if not hasattr(p, "__len__") or len(p) < 2:
+            continue
+        x = float(p[0])
+        y = float(p[1])
+
+        if orient == "none":
+            x2, y2 = x, y
+        elif orient == "cw":
+            # inverse( original -> rotated_cw ):
+            # original(xo,yo) -> (xr = H-1-yo, yr = xo)
+            # => xo = yr, yo = H-1-xr
+            x2 = y
+            y2 = img_h - 1.0 - x
+        elif orient == "ccw":
+            # inverse( original -> rotated_ccw ):
+            # original(xo,yo) -> (xr = yo, yr = W-1-xo)
+            # => xo = W-1-yr, yo = xr
+            x2 = img_w - 1.0 - y
+            y2 = x
+        else:
+            x2, y2 = x, y
+
+        # немного страхуемся от выхода за границы
+        x2 = max(0.0, min(float(img_w - 1), x2))
+        y2 = max(0.0, min(float(img_h - 1), y2))
+
+        out.append([x2, y2])
+
+    return out
+
+def orientation_score(
+    raw_boxes,
+    raw_texts,
+    img_w: int,
+    img_h: int,
+    orient: str,
+    min_chars: int = 3,
+    min_samples: int = 5,
+) -> float:
+    """
+    Оцениваем, насколько страница в данной ориентации похожа на нормальный чек
+    с горизонтальными строками.
+
+    Чем больше score, тем лучше эта ориентация.
+    """
+    aspects: List[float] = []
+
+    for box, text in zip(raw_boxes, raw_texts):
+        if not text:
+            continue
+        clean = str(text).replace(" ", "")
+        if len(clean) < min_chars:
+            continue
+
+        # точки в выбранной ориентации
+        pts = transform_box_points(box, img_w, img_h, orient)
+        bbox = compute_bbox_from_points(pts)
+        if bbox is None:
+            continue
+        x1, y1, x2, y2 = bbox
+        w = x2 - x1
+        h = y2 - y1
+        if w <= 0 or h <= 0:
+            continue
+
+        # фильтр по центру: выбрасываем боксы у самого края (логотипы, вертикальные бордеры)
+        cx = (x1 + x2) / 2.0
+        if cx < img_w * 0.1 or cx > img_w * 0.9:
+            continue
+
+        aspects.append(w / h)
+
+    if len(aspects) < min_samples:
+        return -1e9  # мало данных, ориентация непонятна
+
+    aspects.sort()
+    median_ar = aspects[len(aspects) // 2]
+
+    n = len(aspects)
+    frac_horiz = sum(a >= 1.3 for a in aspects) / n
+    frac_vert = sum(a <= 0.75 for a in aspects) / n
+
+    # комбинируем "насколько строки широкие" и "сколько их по сравнению с вертикальными"
+    score = median_ar + 0.5 * (frac_horiz - frac_vert)
+    return score
+
+
+def choose_best_orientation(raw_boxes, raw_texts, img_w: int, img_h: int) -> str:
+    """
+    Пробуем три варианта: без поворота, cw, ccw.
+    Выбираем тот, где медиана w/h максимальна.
+    Но поворачиваем только если выигрыш по сравнению с 'none' значимый.
+    """
+    candidates = ["none", "cw", "ccw"]
+    scores: Dict[str, float] = {}
+
+    for o in candidates:
+        scores[o] = orientation_score(raw_boxes, raw_texts, img_w, img_h, o)
+
+    best_orient = max(scores.items(), key=lambda kv: kv[1])[0]
+    best_score = scores[best_orient]
+    base_score = scores.get("none", -1e9)
+
+    # Если "none" и так неплохой, а выигрыш небольшой — не вращаем
+    if best_orient != "none" and best_score > 1.3 and best_score - base_score > 0.5:
+        return best_orient
+    return "none"
+
 def run_paddlex_ocr_on_image(
     ocr_pipeline,
     img_bgr,
     min_confidence: float = 0.0,
+    img_path: Path|None = None
 ) -> Dict[str, Any]:
     """
-    Повторяет идею tilt_client._run_ocr:
-    - преобразуем в PIL
-    - сохраняем временный PNG
-    - ocr_pipeline.predict(path)
-    - достаем boxes/texts/scores
-    Возвращаем данные в виде:
-      {
-        "texts": [...],
-        "scores": [...],
-        "boxes": [ [[x,y]*4], ... ],  # полигоны для overlay
-        "words": [ {"text":..., "bbox":[x1,y1,x2,y2], "score":...}, ... ]  # как у tilt_client
-      }
+    Запуск PaddleX OCR на одном изображении с определением ориентации
+    (none / 90° cw / 90° ccw) на уровне всей страницы и последующим
+    преобразованием всех боксов в координаты оригинального изображения.
     """
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(img_rgb)
 
-    w, h = pil.size
+    img_w, img_h = pil.size
 
     fd, tmp_path = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     try:
         pil.save(tmp_path, format="PNG")
-        raw_out = list(ocr_pipeline.predict(tmp_path))
+        raw_out = list(ocr_pipeline.predict(
+            tmp_path, 
+            use_doc_orientation_classify=DETECT_AND_ROTATE,
+            ))
+        first_dict = raw_out[0]
+        if 'doc_preprocessor_res' in first_dict and 'angle' in first_dict['doc_preprocessor_res']:
+            print(f"angle: {first_dict['doc_preprocessor_res']['angle']}")
     finally:
         try:
             os.remove(tmp_path)
         except Exception:
             pass
+    
+    
+    # def json_default(o):
+    #     if isinstance(o, np.ndarray):
+    #         return o.tolist()
+    #     if isinstance(o, (np.integer, np.floating)):
+    #         return o.item()
+    #     return str(o)  # на крайний случай
+
+    # if img_path is not None and isinstance(img_path, Path):
+    #     json_path = img_path.with_suffix(".json")
+    #     with open(json_path, "w", encoding="utf-8") as f:
+    #         json.dump(list(raw_out), f, ensure_ascii=False, indent=2, default=json_default)
+
+
+    
+    
 
     texts: List[str] = []
     scores: List[float] = []
@@ -209,14 +498,17 @@ def run_paddlex_ocr_on_image(
     words: List[Dict[str, Any]] = []
 
     if not raw_out:
-        return {"texts": texts, "scores": scores, "boxes": polys, "words": words, "width": w, "height": h}
+        return {
+            "texts": texts,
+            "scores": scores,
+            "boxes": polys,
+            "words": words,
+            "width": img_w,
+            "height": img_h,
+        }
 
     page0 = raw_out[0]
 
-    # В разных версиях PaddleX:
-    #   - page0.res — объект
-    #   - {"res": .} — dict
-    #   - объект результата без поля res
     if hasattr(page0, "res"):
         res = page0.res
     elif isinstance(page0, dict) and "res" in page0:
@@ -228,91 +520,77 @@ def run_paddlex_ocr_on_image(
         res = res.__dict__
 
     if not isinstance(res, dict):
-        return {"texts": texts, "scores": scores, "boxes": polys, "words": words, "width": w, "height": h}
+        return {
+            "texts": texts,
+            "scores": scores,
+            "boxes": polys,
+            "words": words,
+            "width": img_w,
+            "height": img_h,
+        }
 
-    raw_boxes = _first_nonempty(res, ("rec_boxes", "dt_polys", "det_boxes", "boxes"))
+    raw_boxes = _first_nonempty(res, ("dt_polys", "det_boxes", "boxes", "rec_boxes"))
     raw_texts = _first_nonempty(res, ("rec_texts", "rec_text", "texts"))
     raw_scores = _first_nonempty(res, ("rec_scores", "rec_score", "scores"))
 
     if raw_boxes is None or raw_texts is None:
-        return {"texts": texts, "scores": scores, "boxes": polys, "words": words, "width": w, "height": h}
+        return {
+            "texts": texts,
+            "scores": scores,
+            "boxes": polys,
+            "words": words,
+            "width": img_w,
+            "height": img_h,
+        }
 
-    # приводим боксы к numpy для удобства
-    if np is not None:
-        try:
-            boxes_arr = np.array(raw_boxes)
-        except Exception:
-            boxes_arr = raw_boxes
-    else:
-        boxes_arr = raw_boxes
+    boxes_seq = list(raw_boxes)
+    texts_seq = list(raw_texts)
+    scores_seq = list(raw_scores) if raw_scores is not None else None
 
-    # нормализатор: box -> bbox [x1,y1,x2,y2] и poly4
-    def normalize_box(box) -> Optional[Tuple[List[float], List[List[float]]]]:
-        try:
-            # numpy-путь
-            if np is not None and isinstance(box, np.ndarray):
-                pts = box.reshape(-1, 2)
-                x1 = float(pts[:, 0].min())
-                y1 = float(pts[:, 1].min())
-                x2 = float(pts[:, 0].max())
-                y2 = float(pts[:, 1].max())
-                bbox = [x1, y1, x2, y2]
-                poly = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-                return bbox, poly
-
-            # если это [x1,y1,x2,y2]
-            if (
-                isinstance(box, (list, tuple))
-                and len(box) == 4
-                and all(isinstance(v, (int, float)) for v in box)
-            ):
-                x1, y1, x2, y2 = map(float, box)
-                bbox = [x1, y1, x2, y2]
-                poly = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-                return bbox, poly
-
-            # иначе ожидаем список точек
-            pts = list(box)
-            xs = [float(p[0]) for p in pts]
-            ys = [float(p[1]) for p in pts]
-            x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
-            bbox = [x1, y1, x2, y2]
-
-            # если есть ровно 4 точки - используем их как poly
-            poly_pts: List[List[float]] = []
-            for p in pts:
-                if isinstance(p, (list, tuple)) and len(p) >= 2:
-                    poly_pts.append([float(p[0]), float(p[1])])
-
-            if len(poly_pts) == 4:
-                poly = poly_pts
-            else:
-                poly = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-
-            return bbox, poly
-        except Exception:
-            return None
-
-    for idx, (box, text) in enumerate(zip(boxes_arr, raw_texts)):
+    
+    # 1) Выбираем ориентацию для ВСЕЙ страницы
+    orient = choose_best_orientation(boxes_seq, texts_seq, img_w, img_h)
+    print("Chosen orientation:", orient)  # можно раскомментировать для дебага
+    
+    # 2) Применяем её ко всем боксам
+    for idx, (box, text) in enumerate(zip(boxes_seq, texts_seq)):
         if not text:
             continue
-
+        print(f"box: {box}, type: {type(box)}")
+        # confidence
         score = 1.0
-        if raw_scores is not None and idx < len(raw_scores):
+        if scores_seq is not None and idx < len(scores_seq):
             try:
-                score = float(raw_scores[idx])
+                score = float(scores_seq[idx])
             except Exception:
                 score = 1.0
 
         if score < min_confidence:
             continue
-
-        norm = normalize_box(box)
-        if norm is None:
+        
+        if DETECT_AND_ROTATE:
+            orient = 'none'
+        pts = transform_box_points(box, img_w, img_h, orient)
+        bbox = compute_bbox_from_points(pts)
+        if bbox is None:
             continue
-        bbox, poly = norm
+        print(f"pts: {pts}, type: {type(pts)}")
+        print(f"box: {list(box)}, type: {type(box)}")
+        print(f"bbox: {bbox}, type: {type(bbox)}")
 
-        words.append({"text": str(text), "bbox": bbox, "score": float(score)})
+
+        x1, y1, x2, y2 = bbox
+        
+        
+        poly = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+
+        words.append(
+            {
+                "text": str(text),
+                "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                "score": float(score),
+            }
+        )
         texts.append(str(text))
         scores.append(float(score))
         polys.append(poly)
@@ -322,14 +600,71 @@ def run_paddlex_ocr_on_image(
         "scores": scores,
         "boxes": polys,
         "words": words,
-        "width": int(w),
-        "height": int(h),
+        "width": img_w,
+        "height": img_h,
     }
-
 
 # -------------------------
 # Визуализация
 # -------------------------
+
+def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int, int]:
+    """
+    Кросс-версионное измерение текста:
+    - Pillow >= 10: draw.textbbox
+    - старые версии: font.getsize
+    """
+    # Новый способ (Pillow 10+)
+    if hasattr(draw, "textbbox"):
+        try:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+            return int(w), int(h)
+        except Exception:
+            pass
+
+    # Старый способ
+    try:
+        w, h = font.getsize(text)
+        return int(w), int(h)
+    except Exception:
+        pass
+
+    # Совсем грубый fallback
+    size = getattr(font, "size", 16)
+    return len(text) * size, size
+
+
+def _load_nice_font(size: int) -> ImageFont.ImageFont:
+    """
+    Пытаемся взять нормальный TTF-шрифт (Windows и Linux).
+    Если не нашли — падаем на default.
+    """
+    # 1) сначала пробуем по имени шрифта (на Windows обычно достаточно arial.ttf)
+    for name in ("arial.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size=size)
+        except Exception:
+            pass
+
+    # 2) типичные пути Linux + явный путь для Windows
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
+    for p in font_paths:
+        try:
+            if Path(p).exists():
+                return ImageFont.truetype(p, size=size)
+        except Exception:
+            continue
+
+    # 3) совсем уж запасной вариант — встроенный мелкий шрифт
+    return ImageFont.load_default()
+
 
 def draw_overlay_pil(img_bgr, paddle_data: Dict[str, Any]) -> Image.Image:
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -340,17 +675,14 @@ def draw_overlay_pil(img_bgr, paddle_data: Dict[str, Any]) -> Image.Image:
     texts = paddle_data.get("texts") or []
     scores = paddle_data.get("scores") or []
 
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
+    font = _load_nice_font(size=18)
 
     for i, box in enumerate(boxes):
         if len(box) != 4:
             continue
 
         xy = [(box[j][0], box[j][1]) for j in range(4)]
-        draw.line(xy + [xy[0]], width=2)
+        draw.line(xy + [xy[0]], width=2, fill=(255, 255, 255))
 
         label = ""
         if i < len(texts):
@@ -360,43 +692,61 @@ def draw_overlay_pil(img_bgr, paddle_data: Dict[str, Any]) -> Image.Image:
 
         if label:
             x0, y0 = xy[0]
-            draw.text((x0 + 2, y0 + 2), label, font=font)
+            tw, th = _measure_text(draw, label, font)
+            draw.rectangle(
+                (x0 + 1, y0 + 1, x0 + 1 + tw, y0 + 1 + th),
+                fill=(255, 255, 255),
+            )
+            draw.text((x0 + 1, y0 + 1), label, font=font, fill=(0, 0, 0))
 
     return pil
 
 
-def draw_overlay_on_white(img_bgr, paddle_data: Dict[str, Any]) -> Image.Image:
+def draw_paddle_on_white(img_bgr, paddle_data: Dict[str, Any], font_size: int | None = None) -> Image.Image:
+    """
+    Рисуем только результаты Paddle на белом фоне,
+    чёрный шрифт нормального размера.
+    """
     h, w = img_bgr.shape[:2]
+
+    if font_size is None:
+        # адаптивный размер: чем выше чек, тем больше шрифт
+        font_size = max(12, h // 45)
+        #font_size = 12
+
     pil = Image.new("RGB", (w, h), (255, 255, 255))
     draw = ImageDraw.Draw(pil)
 
     boxes = paddle_data.get("boxes") or []
     texts = paddle_data.get("texts") or []
-    scores = paddle_data.get("scores") or []
 
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
+    font = _load_nice_font(size=font_size)
+
+    line_width = max(2, h // 400)
 
     for i, box in enumerate(boxes):
         if len(box) != 4:
             continue
 
         xy = [(box[j][0], box[j][1]) for j in range(4)]
-        draw.line(xy + [xy[0]], width=2)
+        draw.line(xy + [xy[0]], width=line_width, fill=(0, 0, 0))
 
-        label = ""
-        if i < len(texts):
-            label += texts[i]
-        if i < len(scores):
-            label += f" ({scores[i]:.2f})"
+        label = texts[i] if i < len(texts) else ""
+        if not label:
+            continue
 
-        if label:
-            x0, y0 = xy[0]
-            draw.text((x0 + 2, y0 + 2), label, font=font)
+        x0, y0 = xy[0]
+        draw.text((x0 + 4, y0 + 2), label, font=font, fill=(0, 0, 0))
 
     return pil
+
+
+def draw_overlay_on_white(img_bgr, paddle_data: Dict[str, Any]) -> Image.Image:
+    """
+    Старый вариант «просто белый фон», оставлен для совместимости.
+    Сейчас он использует тот же крупный шрифт.
+    """
+    return draw_paddle_on_white(img_bgr, paddle_data, font_size=18)
 
 
 def make_tilt_like_image(img_bgr, paddle_data: Dict[str, Any]) -> Image.Image:
@@ -436,6 +786,22 @@ def make_tilt_like_image(img_bgr, paddle_data: Dict[str, Any]) -> Image.Image:
 
     crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     return Image.fromarray(crop_rgb)
+
+
+def make_side_by_side_image(img_bgr, paddle_data: Dict[str, Any], font_size: int | None = None) -> Image.Image:
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    left = Image.fromarray(img_rgb)
+
+    right = draw_paddle_on_white(img_bgr, paddle_data, font_size=font_size)
+
+    h = max(left.height, right.height)
+    w = left.width + right.width
+
+    canvas = Image.new("RGB", (w, h), (255, 255, 255))
+    canvas.paste(left, (0, 0))
+    canvas.paste(right, (left.width, 0))
+
+    return canvas
 
 
 # -------------------------
@@ -496,7 +862,9 @@ def main() -> None:
             ocr,
             img_bgr,
             min_confidence=MIN_CONFIDENCE,
+            img_path=img_path,
         )
+
         rec["paddle"] = paddle_data
 
         base_name = img_path.stem
@@ -515,6 +883,10 @@ def main() -> None:
         if SAVE_TILT_LIKE:
             tilt_like = make_tilt_like_image(img_bgr, paddle_data)
             tilt_like.save(img_out / f"{safe_name}__tilt_like.png")
+
+        if SAVE_SIDE_BY_SIDE:
+            sbs = make_side_by_side_image(img_bgr, paddle_data)
+            sbs.save(img_out / f"{safe_name}__paddlex_side_by_side.png")
 
         processed += 1
 

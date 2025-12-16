@@ -68,6 +68,7 @@ def load_gt(gt_path: Path) -> List[Dict[str, Any]]:
             records.append(rec)
         return records
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generic CORD mini-benchmark for a single numeric field."

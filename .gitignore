@@ -5,6 +5,7 @@ __pycache__/
 .notebooks_cache/
 # артефакты/данные — вне гита
 /data/*.parquet
+/out/
 /models/
 /outputs/
 /wheelhouse*/
