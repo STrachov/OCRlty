@@ -183,11 +183,10 @@ async def extract(
 
     return {
         "data": fields,
-        "meta": {
-            "request_id": request_id,
-            "model_version": TILT_MODEL,
-            "ruleset_version": os.getenv("RULESET_VERSION", "rules-0.1.0"),
-            "source_file": file.filename,
-            "mock_vllm": MOCK_VLLM,
-        },
+        # "meta": {
+        #     "request_id": request_id,
+        #     "model_version": TILT_MODEL,
+        #     "ruleset_version": os.getenv("RULESET_VERSION", "rules-0.1.0"),
+        #     "source_file": file.filename
+        # },
     }
