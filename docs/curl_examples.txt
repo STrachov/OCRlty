@@ -32,7 +32,7 @@ Find the line with the cash and read the amount written next to it.
 Answer with that amount exactly as it is printed on the receipt, including any minus sign and currency symbol, and nothing else.'
 
 
-
+________________________________
 You see the OCR words and positions from a sales receipt.
 
 Find all line items (products) that the customer bought.
@@ -59,7 +59,7 @@ Answer with that amount exactly as it is printed on the receipt, including any m
 
 
 
-
+________________________
 You see the OCR words and positions from a sales receipt.
 
 Find all line items (products) that the customer bought.
@@ -80,7 +80,7 @@ Use the text exactly as it is printed on the receipt.
 Do not include any other text before or after the list.
 
 
-
+_________________________
 python scripts/eval_cord_field.py \
   --field total_price \
   --prompt "You see the OCR words and positions from a sales receipt.
@@ -88,3 +88,25 @@ python scripts/eval_cord_field.py \
 Find the final total amount the customer must pay (after all discounts and taxes).
 Answer with that amount exactly as it is printed on the receipt, including currency symbol if any, and nothing else."
 
+_________________________
+
+curl -X POST "http://127.0.0.1:8000/v1/extract" \
+-H "Accept: application/json" \
+-F "file=@/workspace/src/data/cord_subset/images/cord_0008.jpg;type=image/png" \
+-F 'question=You see the OCR words and positions from a sales receipt. 
+Find the line with the total amount (may be labeled with word grand or using abbreviations like ttl) and read the amount written right to it (don't change it at all).'
+___________
+You see OCR words and their bounding boxes from a sales receipt.
+
+Your task: return the FINAL TOTAL amount the customer must pay.
+How to locate the total label:
+- The label can be "TOTAL", "Grand Total", "Amount Due", "Due", "Balance", or abbreviations like "TL", "TTL", "TOT", "TOTL" (case-insensitive).
+How to select the value:
+- Find the value printed to the RIGHT of that label on the same line.
+- "Same line" means the value token’s bounding box vertically overlaps the label token’s bounding box.
+- If multiple numbers are on the right, choose the closest one to the label (smallest horizontal gap).
+CRITICAL COPY RULES:
+- Output MUST be copied EXACTLY from the OCR tokens (character-for-character).
+- Do NOT normalize or reformat numbers in any way:
+  do NOT change "." to "," or "," to "."
+- Output ONLY that text, nothing else.'

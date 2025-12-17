@@ -506,13 +506,7 @@ Output JSON only. """
             )
         return w, h, out_words
 
-    # ------------------------------------------------------------------ #
-    # Парсинг ответа модели
-    # ------------------------------------------------------------------ #
-
-    def _parse_response(self, content: str) -> Dict[str, Any]:
-        return _extract_json_from_text(content)
-
+    
     # ------------------------------------------------------------------ #
     # Публичный API
     # ------------------------------------------------------------------ #
@@ -588,7 +582,8 @@ Output JSON only. """
                 f"Unexpected tilt_api response structure: {e}; got: {resp}"
             ) from e
 
-        return self._parse_response(content)
+        #return self._extract_json_from_text(content)
+        return content
 
     def close(self) -> None:
         try:
