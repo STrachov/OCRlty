@@ -92,21 +92,40 @@ _________________________
 
 curl -X POST "http://127.0.0.1:8000/v1/extract" \
 -H "Accept: application/json" \
--F "file=@/workspace/src/data/cord_subset/images/cord_0008.jpg;type=image/png" \
--F 'question=You see the OCR words and positions from a sales receipt. 
-Find the line with the total amount (may be labeled with word grand or using abbreviations like ttl) and read the amount written right to it (don't change it at all).'
-___________
-You see OCR words and their bounding boxes from a sales receipt.
+-F "file=@/workspace/src/data/cord_subset/images/cord_0050.jpg;type=image/png" \
+-F 'question=What is the name of the THIRD purchased item on this receipt?
+If there is no the THIRD item, output NONE.'
 
-Your task: return the FINAL TOTAL amount the customer must pay.
-How to locate the total label:
-- The label can be "TOTAL", "Grand Total", "Amount Due", "Due", "Balance", or abbreviations like "TL", "TTL", "TOT", "TOTL" (case-insensitive).
-How to select the value:
-- Find the value printed to the RIGHT of that label on the same line.
-- "Same line" means the value token’s bounding box vertically overlaps the label token’s bounding box.
-- If multiple numbers are on the right, choose the closest one to the label (smallest horizontal gap).
-CRITICAL COPY RULES:
-- Output MUST be copied EXACTLY from the OCR tokens (character-for-character).
-- Do NOT normalize or reformat numbers in any way:
-  do NOT change "." to "," or "," to "."
-- Output ONLY that text, nothing else.'
+
+
+You see the OCR words and positions from a sales receipt.\n\nFind the final total amount the customer must pay (after all discounts and taxes).
+Answer with that amount exactly as it is printed on the receipt, including currency symbol if any, and nothing else.
+____________
+Pick the total amount (may be labeled with word grand or using abbreviations like ttl).
+Return EXACTLY ONE of these strings (copy-paste, no edits):
+[43.636, 100.000, 48.000, 52.000]
+Output only the chosen string.
+
+You see the OCR words and positions from a sales receipt. 
+Find the line with the total amount (may be labeled with word grand or using abbreviations like ttl) and return the amount written right to it.
+______________
+Pick the TOTAL amount.
+Return EXACTLY ONE of these strings (copy-paste, no edits):
+[36.000, Rp51.000, 15.000, Rp0.000]
+Output only the chosen string.
+___________________
+Pick ONLY the product/service line items (purchased items) from this receipt.
+Exclude totals and payment lines such as: SUBTOTAL, TOTAL/TL, TAX, CASH, CHANGE/CG, etc.
+
+Return ONLY elements FROM THIS ARRAY (copy characters exactly, no edits).
+Output each chosen element on a new line. Output nothing else.
+
+[
+"01|CHO MOUSSE .20,000",
+"02|GRAPE JELLY .13,000",
+"03|SUBTOTAL .30,000",
+"04|TAX 10% .3,000",
+"05|TL 33,000",
+"06|CASH .50,000",
+"07|CG .17,000"
+]

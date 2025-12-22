@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 import logging
 import tempfile
-
+import re
 logger = logging.getLogger(__name__)
 
 # Опциональные тяжёлые зависимости: используем ленивый импорт
@@ -35,6 +35,27 @@ except Exception:  # pragma: no cover
     create_pipeline = None  # type: ignore[assignment]
 
 MOCK = os.getenv("MOCK_VLLM", "0") == "1"
+CANDIDATES_PLACEHOLDER = "{{}}"
+
+DEFAULT_MAX_CANDIDATES = os.getenv('DEFAULT_MAX_CANDIDATES', 8)
+DEFAULT_MAX_NEIGHBOURS = os.getenv('DEFAULT_MAX_NEIGHBOURS', 3)
+
+# Нормализованные анкоры (ты можешь расширять словарь по мере нужды)
+FIELD_ANCHOR_TIERS = {
+    "total_price": [
+        # Tier 1: более специфичные "итоговые" ярлыки (имеют приоритет)
+        [("GRAND", "TOTAL"), "GRANDTOTAL", ("AMOUNT", "DUE"), "AMOUNTDUE", ("BALANCE", "DUE"), "BALANCEDUE"],
+        # Tier 2: fallback
+        ["TOTAL", "T0TAL", "TOTL", "TTL"],
+    ],
+    "cash": [
+        ["CASH", "TENDER", "TENDERED", "PAID", "RECEIVED", "RCVD"],
+    ],
+    "change": [
+        ["CHANGE", "CHNG", "CHG"],
+    ],
+}
+
 
 
 def _normalize_base_url(url: str) -> str:
@@ -63,9 +84,8 @@ def _extract_json_from_text(text: str) -> Dict[str, Any]:
         return json.loads(text)
 
     # 2) ```json ... ```
-    import re as _re
-
-    blocks = _re.findall(r"```json(.*?)```", text, flags=_re.DOTALL | _re.IGNORECASE)
+    
+    blocks = re.findall(r"```json(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
     for b in blocks:
         try:
             return json.loads(b.strip())
@@ -512,30 +532,189 @@ Output JSON only. """
 
     def _parse_response(self, content: str) -> Dict[str, Any]:
         return _extract_json_from_text(content)
-        
+
     # ------------------------------------------------------------------ #
-    # Публичный API
+    # Подготовка кадидатов значений для внедрения в промпт
     # ------------------------------------------------------------------ #
 
-    def infer(self, doc_bytes: bytes, content_type: Optional[str] = None, question: Optional[str] = None) -> Dict[str, Any]:
-        """Основной метод: bytes документа → dict с извлечёнными полями.
+    def _norm_token(self, s: str) -> str:
+        s = (s or "").strip().upper()
+        return re.sub(r"[^A-Z0-9]+", "", s)
 
-        :param doc_bytes: содержимое загруженного файла (PDF/JPEG/PNG)
-        :param content_type: MIME-тип (для PDF более надёжное определение)
-        :param question: вопрос к TILT
+    def _has_digit(self, s: str) -> bool:
+        return any(ch.isdigit() for ch in (s or ""))
+
+    def _bbox_mid_y(self, bbox: List[float]) -> float:
+        return (float(bbox[1]) + float(bbox[3])) / 2.0
+
+    def _bbox_h(self, bbox: List[float]) -> float:
+        return float(bbox[3]) - float(bbox[1])
+
+    def _same_line(self, bbox1: List[float], bbox2: List[float], y_tol_px: float) -> bool:
+        return abs(self._bbox_mid_y(bbox1) - self._bbox_mid_y(bbox2)) <= y_tol_px
+
+    def _is_right_of_anchor(self, anchor_bbox: List[float], cand_bbox: List[float]) -> bool:
+        # cand левым краем должен быть правее правого края anchor (с небольшим допуском)
+        return float(cand_bbox[0]) >= float(anchor_bbox[2]) - 2.0
+
+    def _find_phrase_anchors(self, words: List[Dict[str, Any]], w1: str, w2: str) -> List[int]:
         """
-        if MOCK:
-            # Упрощённый дубль для локальной отладки без TILT'а
-            return {
-                "mock": True,
-                "length_bytes": len(doc_bytes),
-                "content_type": content_type,
-            }
+        Ищем фразу (w1 w2) как два соседних токена: w1 слева от w2 на одной линии.
+        Возвращаем индекс второго токена (w2) как anchor (чтобы "справа" работало одинаково).
+        """
+        w1n = self._norm_token(w1)
+        w2n = self._norm_token(w2)
 
-        images = self._doc_bytes_to_images(doc_bytes, content_type)
-        if not images:
-            raise RuntimeError("No pages produced from input document")
+        out: List[int] = []
+        for i in range(1, len(words)):
+            t2 = self._norm_token(words[i].get("text", ""))
+            if t2 != w2n:
+                continue
+            bbox2 = words[i].get("bbox")
+            if not bbox2 or len(bbox2) != 4:
+                continue
 
+            t1 = self._norm_token(words[i - 1].get("text", ""))
+            if t1 != w1n:
+                continue
+            bbox1 = words[i - 1].get("bbox")
+            if not bbox1 or len(bbox1) != 4:
+                continue
+
+            y_tol = max(8.0, 0.8 * self._bbox_h(bbox2))
+            if self._same_line(bbox1, bbox2, y_tol):
+                out.append(i)
+
+        return out
+
+    def _find_anchor_indices_for_tier(self, words: List[Dict[str, Any]], tier: List[Any]) -> List[int]:
+        """
+        Tier — список паттернов:
+        - str: совпадение по токену
+        - tuple(str,str): фраза из двух токенов (сосед слева + токен)
+        """
+        idxs: List[int] = []
+        tier_token_norm = {self._norm_token(x) for x in tier if isinstance(x, str)}
+
+        for i, w in enumerate(words):
+            t = self._norm_token(w.get("text", ""))
+            if t and t in tier_token_norm:
+                idxs.append(i)
+
+        for pat in tier:
+            if isinstance(pat, tuple) and len(pat) == 2:
+                idxs.extend(self._find_phrase_anchors(words, pat[0], pat[1]))
+
+        # уникализация + сортировка
+        return sorted(set(idxs))
+
+    def _select_anchor_indices_by_priority(self, words: List[Dict[str, Any]], field_name: str) -> List[int]:
+        tiers = FIELD_ANCHOR_TIERS.get(field_name)
+        if not tiers:
+            return []
+
+        for tier in tiers:
+            idxs = self._find_anchor_indices_for_tier(words, tier)
+            if idxs:
+                return idxs  # первый непустой tier выигрывает
+        return []
+
+    def _candidate_from_anchor(self, words: List[Dict[str, Any]], anchor_i: int, max_neighbours: int) -> Optional[str]:
+        anchor_bbox = words[anchor_i].get("bbox")
+        if not anchor_bbox or len(anchor_bbox) != 4:
+            return None
+
+        y_tol = max(8.0, 0.8 * self._bbox_h(anchor_bbox))
+
+        # 1) первый токен справа с цифрой
+        start_j: Optional[int] = None
+        for j in range(anchor_i + 1, len(words)):
+            t = (words[j].get("text") or "").strip()
+            bbox = words[j].get("bbox")
+            if not t or not bbox or len(bbox) != 4:
+                continue
+            if not self._has_digit(t):
+                continue
+            if not self._same_line(anchor_bbox, bbox, y_tol):
+                continue
+            if not self._is_right_of_anchor(anchor_bbox, bbox):
+                continue
+            start_j = j
+            break
+
+        if start_j is None:
+            return None
+
+        # 2) склейка MAX_NEIGHBOURS токенов начиная со start_j
+        parts: List[str] = []
+        for j in range(start_j, min(len(words), start_j + max_neighbours)):
+            t = (words[j].get("text") or "").strip()
+            bbox = words[j].get("bbox")
+            if not t or not bbox or len(bbox) != 4:
+                break
+            if not self._same_line(anchor_bbox, bbox, y_tol):
+                break
+            if not self._is_right_of_anchor(anchor_bbox, bbox):
+                break
+            parts.append(t)
+
+        if not parts:
+            return None
+
+        return "".join(parts)
+
+    def _collect_candidates_from_pages(
+        self,
+        pages_payload: List[Dict[str, Any]],
+        field_name: str,
+        max_candidates: int,
+        max_neighbours: int,
+    ) -> List[str]:
+        """
+        Кандидат = 1 anchor. Кол-во кандидатов = кол-ву найденных anchors (в выбранном tier),
+        но ограничиваем сверху max_candidates.
+        """
+        out: List[str] = []
+        remaining = max_candidates
+
+        for p in pages_payload:
+            ocr = (p or {}).get("ocr") or {}
+            words = ocr.get("words") or []
+            if not words:
+                continue
+
+            anchor_idxs = self._select_anchor_indices_by_priority(words, field_name)
+            for ai in anchor_idxs:
+                if remaining <= 0:
+                    return out
+                cand = self._candidate_from_anchor(words, ai, max_neighbours=max_neighbours)
+                if cand is not None:
+                    out.append(cand)
+                    remaining -= 1
+
+        return out
+
+    def _inject_candidates_into_question(self, base_question: str, candidates: List[str]) -> str:
+        if not candidates:
+            return base_question
+
+        # JSON-массив строк — самый стабильный формат для "копировать без изменений"
+        arr = "[" + ",".join(json.dumps(c) for c in candidates) + "]"
+
+        if CANDIDATES_PLACEHOLDER in base_question:
+            return base_question.replace(CANDIDATES_PLACEHOLDER, arr)
+
+        return (
+            base_question.rstrip()
+            + "\nReturn EXACTLY ONE of these strings (copy-paste, no edits):\n"
+            + arr
+            + "\nOutput only the chosen string."
+        )
+
+    def _build_pages_payload(
+        self, 
+        images: Any,
+    ) -> List[Dict[str, Any]]:
         pages_payload: List[Dict[str, Any]] = []
         total_words = 0
         for page_idx, img in enumerate(images):
@@ -566,17 +745,107 @@ Output JSON only. """
             raise RuntimeError("OCR produced zero words on all pages")
         print(f'[infer] pages_payload={pages_payload}')
 
+        return pages_payload
+
+    # ------------------------------------------------------------------ #
+    # Публичный API
+    # ------------------------------------------------------------------ #
+
+    def debug_candidates(
+        self,
+        doc_bytes: bytes,
+        content_type: Optional[str] = None,
+        question: Optional[str] = None,
+        field_name: Optional[str] = None,
+        max_candidates: Optional[int] = None,
+        max_neighbours: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Прогоняет только OCR + сбор кандидатов + сбор used_question.
+        Модель НЕ вызывается.
+        """
+        # 1) делаем OCR тем же способом, что и в infer()
+        images = self._doc_bytes_to_images(doc_bytes, content_type)
+        if not images:
+            raise RuntimeError("No pages produced from input document")
+        pages_payload = self._build_pages_payload(images)
+
+        base_question = question or self.question
+        used_question = base_question
+        cands: List[str] = []
+
+        if field_name and field_name in FIELD_ANCHOR_TIERS:
+            mc = int(max_candidates) if max_candidates is not None else DEFAULT_MAX_CANDIDATES
+            mn = int(max_neighbours) if max_neighbours is not None else DEFAULT_MAX_NEIGHBOURS
+            cands = self._collect_candidates_from_pages(pages_payload, field_name, mc, mn)
+            used_question = self._inject_candidates_into_question(base_question, cands)
+
+        return {
+            "field_name": field_name,
+            "candidates": cands,
+            "used_question": used_question,
+            "pages_payload_preview": {
+                "num_pages": len(pages_payload),
+                "num_words_page0": len((pages_payload[0].get("ocr") or {}).get("words") or []) if pages_payload else 0,
+            },
+        }
+
+    def infer(
+        self, 
+        doc_bytes: bytes, 
+        content_type: Optional[str] = None, 
+        question: Optional[str] = None,
+        field_name: Optional[str] = None,
+        max_candidates: Optional[int] = None,
+        max_neighbours: Optional[int] = None,
+        ) -> Dict[str, Any]:
+        """Основной метод: bytes документа → dict с извлечёнными полями.
+
+        :param doc_bytes: содержимое загруженного файла (PDF/JPEG/PNG)
+        :param content_type: MIME-тип (для PDF более надёжное определение)
+        :param question: вопрос к TILT
+        """
+        if MOCK:
+            # Упрощённый дубль для локальной отладки без TILT'а
+            return {
+                "mock": True,
+                "length_bytes": len(doc_bytes),
+                "content_type": content_type,
+            }
+
+        images = self._doc_bytes_to_images(doc_bytes, content_type)
+        if not images:
+            raise RuntimeError("No pages produced from input document")
+        
+        pages_payload = self._build_pages_payload(images)
+
+       
+
+        base_question = question or self.question
+        used_question = base_question
+
+        if question is not None and field_name and field_name in FIELD_ANCHOR_TIERS:
+            mc = int(max_candidates) if max_candidates is not None else DEFAULT_MAX_CANDIDATES
+            mn = int(max_neighbours) if max_neighbours is not None else DEFAULT_MAX_NEIGHBOURS
+
+            cands = self._collect_candidates(
+                pages_payload=pages_payload,
+                field_name=field_name,
+                max_candidates=mc,
+                max_neighbours=mn,
+            )
+            used_question = self._inject_candidates_into_question(base_question, cands)
+
         payload: Dict[str, Any] = {
-            "question": question or self.question,
+            "question": used_question,
             "pages": pages_payload,
             "model": self.model,
         }
 
         logger.info(
-            "Sending TILT request: pages=%d, total_words=%d",
-            len(pages_payload),
-            total_words,
-        )
+            "Sending TILT request: pages=%d",
+            len(pages_payload)
+            )
 
         resp = self._post_tilt(payload)
         print(f'[infer] resp={resp}')
@@ -589,7 +858,10 @@ Output JSON only. """
             ) from e
 
         #return self._extract_json_from_text(content)
-        return content
+        return {
+            'response':content, 
+            'used_question':used_question
+            }
 
     def close(self) -> None:
         try:

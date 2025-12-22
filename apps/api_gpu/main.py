@@ -137,6 +137,10 @@ def health() -> Dict[str, Any]:
 async def extract(
     file: UploadFile = File(...), 
     question: Optional[str] = Form(None),
+    field_name: Optional[str] = Form(None),
+    max_candidates: Optional[int] = Form(None),
+    max_neighbours: Optional[int] = Form(None),
+
 ) -> Dict[str, Any]:
     if tilt is None:
         raise HTTPException(status_code=503, detail="Model client not initialized")
@@ -169,20 +173,32 @@ async def extract(
 
     try:
         # важно передать content_type, чтобы корректно определить PDF vs image
-        fields = tilt.infer(content, content_type=file.content_type or None, question=question)
+        tilt_response = tilt.infer(
+            content,
+            content_type=file.content_type or None,
+            question=question,
+            field_name=field_name,
+            max_candidates=max_candidates,
+            max_neighbours=max_neighbours,
+        )
+        field_value = tilt_response['response']
+        used_question = tilt_response['used_question']
+
     except Exception as e:  # noqa: BLE001
         log.exception("TILT inference failed for request %s: %s", request_id, e)
         raise HTTPException(status_code=500, detail=f"TILT inference failed: {e}") from e
 
     if RULES_ENABLED:
         try:
-            fields = postprocess_rules(fields)
+            field_value = postprocess_rules(tilt_response['response'])
+
         except Exception as e:  # noqa: BLE001
             # если правила отвалились — вернём сырые поля, но не уроним запрос
             log.warning("postprocess_rules failed for request %s: %s", request_id, e)
 
     return {
-        "data": fields,
+        "data": field_value,
+        "question": used_question,
         # "meta": {
         #     "request_id": request_id,
         #     "model_version": TILT_MODEL,
