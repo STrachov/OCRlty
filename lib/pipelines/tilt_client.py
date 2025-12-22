@@ -828,7 +828,7 @@ Output JSON only. """
             mc = int(max_candidates) if max_candidates is not None else DEFAULT_MAX_CANDIDATES
             mn = int(max_neighbours) if max_neighbours is not None else DEFAULT_MAX_NEIGHBOURS
 
-            cands = self._collect_candidates(
+            cands = self._collect_candidates_from_pages(
                 pages_payload=pages_payload,
                 field_name=field_name,
                 max_candidates=mc,
