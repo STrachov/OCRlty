@@ -819,12 +819,14 @@ Output JSON only. """
         
         pages_payload = self._build_pages_payload(images)
 
-       
+        
 
         base_question = question or self.question
         used_question = base_question
+        print(f"[tilt_client] field_name={field_name}, base_question={base_question}")
 
-        if question is not None and field_name and field_name in FIELD_ANCHOR_TIERS:
+        if base_question is not None and field_name and field_name in FIELD_ANCHOR_TIERS:
+            print(f"[tilt_client] in if question...")
             mc = int(max_candidates) if max_candidates is not None else DEFAULT_MAX_CANDIDATES
             mn = int(max_neighbours) if max_neighbours is not None else DEFAULT_MAX_NEIGHBOURS
 
@@ -850,10 +852,10 @@ Output JSON only. """
             len(pages_payload),
             cands
             )
-        print(f'[infer] payload={payload}')
+        print(f'[tilt_client] payload={payload}')
 
         resp = self._post_tilt(payload)
-        print(f'[infer] resp={resp}')
+        print(f'[tilt_client] resp={resp}')
 
         try:
             content = resp["choices"][0]["message"]["content"]
