@@ -843,6 +843,7 @@ Output JSON only. """
             "pages": pages_payload,
             "model": self.model,
         }
+        print(f"[tilt_client] cands={cands}")
 
         logger.info(
             "Sending TILT request: pages=%d, cands=%d",
