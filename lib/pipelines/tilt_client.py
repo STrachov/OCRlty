@@ -850,6 +850,7 @@ Output JSON only. """
             len(pages_payload),
             cands
             )
+        print(f'[infer] payload={payload}')
 
         resp = self._post_tilt(payload)
         print(f'[infer] resp={resp}')
