@@ -834,6 +834,8 @@ Output JSON only. """
                 max_candidates=mc,
                 max_neighbours=mn,
             )
+            
+            
             used_question = self._inject_candidates_into_question(base_question, cands)
 
         payload: Dict[str, Any] = {
@@ -843,8 +845,9 @@ Output JSON only. """
         }
 
         logger.info(
-            "Sending TILT request: pages=%d",
-            len(pages_payload)
+            "Sending TILT request: pages=%d, cands=%d",
+            len(pages_payload),
+            cands
             )
 
         resp = self._post_tilt(payload)
