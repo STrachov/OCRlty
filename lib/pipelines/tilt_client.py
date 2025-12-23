@@ -46,7 +46,7 @@ FIELD_ANCHOR_TIERS = {
         # Tier 1: более специфичные "итоговые" ярлыки (имеют приоритет)
         [("GRAND", "TOTAL"), "GRANDTOTAL", ("AMOUNT", "DUE"), "AMOUNTDUE", ("BALANCE", "DUE"), "BALANCEDUE"],
         # Tier 2: fallback
-        ["TOTAL", "T0TAL", "TOTL", "TTL"],
+        ["TOTAL", "T0TAL", "TOTL", "TTL", "TL"],
     ],
     "cash": [
         ["CASH", "TENDER", "TENDERED", "PAID", "RECEIVED", "RCVD"],
@@ -836,6 +836,7 @@ Output JSON only. """
                 max_candidates=mc,
                 max_neighbours=mn,
             )
+            print(f"[tilt_client] cands={cands}")
             
             
             used_question = self._inject_candidates_into_question(base_question, cands)

@@ -15,7 +15,7 @@ client = ArcticTiltClient(
     model="snowflake-arctic-tilt",     # любой, не используется
 )
 
-img = Path("data/cord_subset/images/cord_0046.jpg").read_bytes()
+img = Path("data/cord_subset/images/cord_0050.jpg").read_bytes()
 
 dbg = client.debug_candidates(
     img,

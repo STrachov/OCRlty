@@ -90,14 +90,6 @@ Answer with that amount exactly as it is printed on the receipt, including curre
 
 _________________________
 
-curl -X POST "http://127.0.0.1:8000/v1/extract" \
--H "Accept: application/json" \
--F "file=@/workspace/src/data/cord_subset/images/cord_0050.jpg;type=image/png" \
--F 'question=What is the name of the THIRD purchased item on this receipt?
-If there is no the THIRD item, output NONE.'
-
-
-
 You see the OCR words and positions from a sales receipt.\n\nFind the final total amount the customer must pay (after all discounts and taxes).
 Answer with that amount exactly as it is printed on the receipt, including currency symbol if any, and nothing else.
 ____________
@@ -129,3 +121,14 @@ Output each chosen element on a new line. Output nothing else.
 "06|CASH .50,000",
 "07|CG .17,000"
 ]
+___________________
+
+curl -X POST "http://127.0.0.1:8000/v1/extract" \
+-H "Accept: application/json" \
+-F "file=@/workspace/src/data/cord_subset/images/cord_0050.jpg;type=image/png" \
+-F "field_name=total_price" \
+-F "max_neighbours=3" \
+-F 'question=Pick the TOTAL amount.
+Return EXACTLY ONE of these strings (copy-paste, no edits):
+{{}}
+Output only the chosen string.'
