@@ -1,22 +1,63 @@
 from __future__ import annotations
 
+import json
 import os
+import time
 import uuid
 import logging
 from typing import Any, Dict, Optional
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
 from lib.pipelines.tilt_client import ArcticTiltClient
 from lib.post.rules import postprocess_rules  # теперь обязательная зависимость
 
-log = logging.getLogger("api")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-# === ENV ===
+# -----------------------------------------------------------------------------
+# Logging (shared structured logger)
+# -----------------------------------------------------------------------------
+from lib.utils.logging import get_event_logger
+
+obs = get_event_logger("api", logger_name="api")
+
+# -----------------------------------------------------------------------------
+# Prometheus metrics
+# -----------------------------------------------------------------------------
+PROMETHEUS_ENABLED = os.getenv("PROMETHEUS_ENABLED", "0") == "1"
+if PROMETHEUS_ENABLED:
+    from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
+    HTTP_REQUESTS_TOTAL = Counter(
+        "http_requests_total",
+        "Total HTTP requests",
+        ["service", "path", "method", "status"],
+    )
+    HTTP_REQUEST_DURATION = Histogram(
+        "http_request_duration_seconds",
+        "HTTP request duration in seconds",
+        ["service", "path", "method"],
+    )
+
+    PIPELINE_STAGE_DURATION = Histogram(
+        "pipeline_stage_duration_seconds",
+        "Pipeline stage duration in seconds",
+        ["stage"],
+    )
+
+    PIPELINE_ERRORS_TOTAL = Counter(
+        "pipeline_errors_total",
+        "Pipeline errors by code",
+        ["stage", "error_code"],
+    )
+
+
+# -----------------------------------------------------------------------------
+# ENV
+# -----------------------------------------------------------------------------
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://vllm:8001/v1").rstrip("/")
 TILT_MODEL = os.getenv("TILT_MODEL", "Snowflake/snowflake-arctic-tilt-v1.3")
 TILT_TIMEOUT_S = float(os.getenv("TILT_TIMEOUT_S", "10.0"))
@@ -36,7 +77,7 @@ ALLOWED_CONTENT_TYPES = {
 }
 
 # Позволяет временно отключить правила без изменений кода
-RULES_ENABLED = os.getenv("RULES_ENABLED", "1") == "1"
+RULES_ENABLED = os.getenv("RULES_ENABLED", "0") == "1"
 
 tilt: ArcticTiltClient | None = None  # singleton
 
@@ -45,33 +86,41 @@ tilt: ArcticTiltClient | None = None  # singleton
 async def lifespan(app: FastAPI):
     """Startup/Shutdown через lifespan."""
     global tilt
-    log.info(
-        "Starting API; VLLM_BASE_URL=%s, MODEL=%s, MOCK_VLLM=%s, RULES_ENABLED=%s",
-        VLLM_BASE_URL,
-        TILT_MODEL,
-        MOCK_VLLM,
-        RULES_ENABLED,
+
+    obs.log_event(
+        "info",
+        "api.starting",
+        request_id=None,
+        config={
+            "vllm_base_url": VLLM_BASE_URL,
+            "model": TILT_MODEL,
+            "mock_vllm": MOCK_VLLM,
+            "rules_enabled": RULES_ENABLED,
+        },
     )
+
     tilt = ArcticTiltClient(
         base_url=VLLM_BASE_URL,
         model=TILT_MODEL,
         timeout=TILT_TIMEOUT_S,
         api_key=VLLM_API_KEY,
     )
+
     # Лёгкий ping tilt_api /v1/health (не критично для старта)
     try:
         with httpx.Client(timeout=5.0) as cli:
             r = cli.get(f"{VLLM_BASE_URL}/health")
             r.raise_for_status()
             health = r.json()
-            log.info(
-                "tilt_api ready; model=%s, dtype=%s, tp=%s",
-                health.get("model"),
-                health.get("dtype"),
-                health.get("tp_size"),
+            obs.log_event(
+                "info",
+                "tilt_api.health_ok",
+                model=health.get("model"),
+                dtype=health.get("dtype"),
+                tp_size=health.get("tp_size"),
             )
     except Exception as e:  # noqa: BLE001
-        log.warning("tilt_api /health ping failed: %s", e)
+        obs.log_event("warning", "tilt_api.health_failed", error={"type": type(e).__name__, "message": str(e)})
 
     yield
 
@@ -79,7 +128,7 @@ async def lifespan(app: FastAPI):
         if tilt is not None:
             tilt.close()
     except Exception as e:  # noqa: BLE001
-        log.warning("Error while closing ArcticTiltClient: %s", e)
+        obs.log_event("warning", "api.shutdown_close_client_failed", error={"type": type(e).__name__, "message": str(e)})
 
 
 app = FastAPI(
@@ -98,6 +147,72 @@ if ENABLE_CORS:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+
+# -----------------------------------------------------------------------------
+# Middleware: Request-ID + HTTP metrics + structured access log
+# -----------------------------------------------------------------------------
+@app.middleware("http")
+async def request_id_and_metrics(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    request.state.request_id = request_id
+
+    path = request.url.path
+    method = request.method
+
+    t0 = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+    except HTTPException as e:
+        status = int(e.status_code)
+        obs.log_event(
+            "warning",
+            "api.http_exception",
+            request_id=request_id,
+            http={"method": method, "path": path, "status": status},
+            error={"type": "HTTPException", "message": str(e.detail)},
+        )
+        raise
+    except Exception as e:  # noqa: BLE001
+        status = 500
+        obs.log_event(
+            "error",
+            "api.unhandled_exception",
+            request_id=request_id,
+            http={"method": method, "path": path, "status": status},
+            error={"type": type(e).__name__, "message": str(e)},
+        )
+        raise
+    finally:
+        dt = time.perf_counter() - t0
+        if PROMETHEUS_ENABLED:
+            HTTP_REQUESTS_TOTAL.labels("api", path, method, str(status)).inc()
+            HTTP_REQUEST_DURATION.labels("api", path, method).observe(dt)
+
+        # structured access log (only for API calls, keep it concise)
+        obs.log_event(
+            "info",
+            "api.request_done",
+            request_id=request_id,
+            http={"method": method, "path": path, "status": status},
+            duration_ms=round(dt * 1000.0, 3),
+        )
+
+    # Add correlation header
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
+@app.get("/metrics", tags=["meta"])
+def metrics() -> Response:
+    if not PROMETHEUS_ENABLED:
+        raise HTTPException(status_code=404, detail="Prometheus metrics disabled")
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/v1/health", tags=["meta"])
@@ -135,74 +250,123 @@ def health() -> Dict[str, Any]:
 
 @app.post("/v1/extract", tags=["inference"])
 async def extract(
-    file: UploadFile = File(...), 
+    request: Request,
+    file: UploadFile = File(...),
     question: Optional[str] = Form(None),
     field_name: Optional[str] = Form(None),
     max_candidates: Optional[int] = Form(None),
     max_neighbours: Optional[int] = Form(None),
-
 ) -> Dict[str, Any]:
     if tilt is None:
+        if PROMETHEUS_ENABLED:
+            PIPELINE_ERRORS_TOTAL.labels("api", "MODEL_CLIENT_NOT_INITIALIZED").inc()
         raise HTTPException(status_code=503, detail="Model client not initialized")
 
+    request_id: str = getattr(request.state, "request_id", uuid.uuid4().hex)
+
+    # read file bytes early to compute size
+    content = await file.read()
+    size_bytes = len(content)
+
+    obs.log_event(
+        "info",
+        "api.extract_received",
+        request_id=request_id,
+        doc={
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "size_bytes": size_bytes,
+        },
+        question_len_chars=len(question or ""),
+    )
+
     if file.content_type not in ALLOWED_CONTENT_TYPES:
+        if PROMETHEUS_ENABLED:
+            PIPELINE_ERRORS_TOTAL.labels("api", "UNSUPPORTED_CONTENT_TYPE").inc()
         raise HTTPException(
             status_code=415,
             detail=f"Unsupported content-type '{file.content_type}'. Allowed: {sorted(ALLOWED_CONTENT_TYPES)}",
         )
 
-    content = await file.read()
     if not content:
+        if PROMETHEUS_ENABLED:
+            PIPELINE_ERRORS_TOTAL.labels("api", "UPLOAD_EMPTY").inc()
         raise HTTPException(status_code=400, detail="Empty file")
 
     max_bytes = MAX_UPLOAD_MB * 1024 * 1024
-    if len(content) > max_bytes:
+    if size_bytes > max_bytes:
+        if PROMETHEUS_ENABLED:
+            PIPELINE_ERRORS_TOTAL.labels("api", "UPLOAD_TOO_LARGE").inc()
         raise HTTPException(
             status_code=413,
-            detail=f"File too large: {len(content)} bytes > {max_bytes} bytes",
+            detail=f"File too large: {size_bytes} bytes > {max_bytes} bytes",
         )
 
-    request_id = uuid.uuid4().hex
-    log.info(
-        "Request %s: filename=%s, content_type=%s, size=%d bytes",
-        request_id,
-        file.filename,
-        file.content_type,
-        len(content),
-    )
-
+    # Inference (TILT client)
+    t0 = time.perf_counter()
     try:
-        # важно передать content_type, чтобы корректно определить PDF vs image
         tilt_response = tilt.infer(
-            content,
-            content_type=file.content_type or None,
-            question=question,
+            content, 
+            content_type=file.content_type or None, question=question,
             field_name=field_name,
+            request_id=request_id,
             max_candidates=max_candidates,
             max_neighbours=max_neighbours,
-        )
-        field_value = tilt_response['response']
+            )
+        fields = tilt_response['response']
         used_question = tilt_response['used_question']
-
     except Exception as e:  # noqa: BLE001
-        log.exception("TILT inference failed for request %s: %s", request_id, e)
+        if PROMETHEUS_ENABLED:
+            PIPELINE_ERRORS_TOTAL.labels("tilt_client", "INFER_FAILED").inc()
+        obs.log_event(
+            "error",
+            "api.tilt_infer_failed",
+            request_id=request_id,
+            error={"type": type(e).__name__, "message": str(e)},
+        )
         raise HTTPException(status_code=500, detail=f"TILT inference failed: {e}") from e
+    finally:
+        dt = time.perf_counter() - t0
+        if PROMETHEUS_ENABLED:
+            PIPELINE_STAGE_DURATION.labels("tilt_infer").observe(dt)
 
+    # Postprocess rules (optional)
+    rules_applied = False
     if RULES_ENABLED:
+        t1 = time.perf_counter()
         try:
-            field_value = postprocess_rules(tilt_response['response'])
-
+            fields = postprocess_rules(fields)
+            rules_applied = True
         except Exception as e:  # noqa: BLE001
-            # если правила отвалились — вернём сырые поля, но не уроним запрос
-            log.warning("postprocess_rules failed for request %s: %s", request_id, e)
+            if PROMETHEUS_ENABLED:
+                PIPELINE_ERRORS_TOTAL.labels("postprocess", "RULES_FAILED").inc()
+            obs.log_event(
+                "warning",
+                "api.postprocess_rules_failed",
+                request_id=request_id,
+                error={"type": type(e).__name__, "message": str(e)},
+            )
+        finally:
+            dt_rules = time.perf_counter() - t1
+            if PROMETHEUS_ENABLED:
+                PIPELINE_STAGE_DURATION.labels("postprocess_rules").observe(dt_rules)
+
+    obs.log_event(
+        "info",
+        "api.extract_done",
+        request_id=request_id,
+        rules_applied=rules_applied,
+    )
 
     return {
-        "data": field_value,
+        "data": fields,
         "question": used_question,
-        # "meta": {
-        #     "request_id": request_id,
-        #     "model_version": TILT_MODEL,
-        #     "ruleset_version": os.getenv("RULESET_VERSION", "rules-0.1.0"),
-        #     "source_file": file.filename
-        # },
+        "meta": {
+            "request_id": request_id,
+            "model_version": TILT_MODEL,
+            "ruleset_version": os.getenv("RULESET_VERSION", "rules-0.1.0"),
+            "rules_enabled": RULES_ENABLED,
+            "rules_applied": rules_applied,
+            "source_file": file.filename,
+        },
     }

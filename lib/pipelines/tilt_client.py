@@ -4,13 +4,15 @@ import io
 import json
 import os
 import time
+import tempfile
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-import logging
-import tempfile
-import re
-logger = logging.getLogger(__name__)
+
+from lib.utils.logging import get_event_logger  # shared structured logger
+
+obs = get_event_logger("tilt_client", logger_name=__name__)
 
 # Опциональные тяжёлые зависимости: используем ленивый импорт
 try:  # Pillow для работы с изображениями
@@ -34,11 +36,12 @@ try:
 except Exception:  # pragma: no cover
     create_pipeline = None  # type: ignore[assignment]
 
+
 MOCK = os.getenv("MOCK_VLLM", "0") == "1"
 CANDIDATES_PLACEHOLDER = "{{}}"
 
-DEFAULT_MAX_CANDIDATES = os.getenv('DEFAULT_MAX_CANDIDATES', 8)
-DEFAULT_MAX_NEIGHBOURS = os.getenv('DEFAULT_MAX_NEIGHBOURS', 3)
+DEFAULT_MAX_CANDIDATES = int(os.getenv("DEFAULT_MAX_CANDIDATES", "8"))
+DEFAULT_MAX_NEIGHBOURS = int(os.getenv("DEFAULT_MAX_NEIGHBOURS", "3"))
 
 # Нормализованные анкоры (ты можешь расширять словарь по мере нужды)
 FIELD_ANCHOR_TIERS = {
@@ -57,7 +60,6 @@ FIELD_ANCHOR_TIERS = {
 }
 
 
-
 def _normalize_base_url(url: str) -> str:
     url = (url or "").strip().rstrip("/")
     if not url:
@@ -67,24 +69,16 @@ def _normalize_base_url(url: str) -> str:
 
 
 def _extract_json_from_text(text: str) -> Dict[str, Any]:
-    """Достаём JSON даже если модель вернула его внутри текста/```json```.
-
-    Логика:
-    1) если вся строка — это JSON-объект, просто парсим;
-    2) иначе ищем блоки ```json ... ``` и пробуем их;
-    3) иначе ищем первую сбалансированную {...} в тексте;
-    4) в крайнем случае даём понятную ошибку.
-    """
-    text = text.strip()
+    """Достаём JSON даже если модель вернула его внутри текста/```json```."""
+    text = (text or "").strip()
     if not text:
         raise ValueError("Empty response from model")
-    print(f'[_extract_json_from_text] text=:{text}')
+
     # 1) чистый JSON-объект
     if text.startswith("{") and text.endswith("}"):
         return json.loads(text)
 
     # 2) ```json ... ```
-    
     blocks = re.findall(r"```json(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
     for b in blocks:
         try:
@@ -116,17 +110,16 @@ def _extract_json_from_text(text: str) -> Dict[str, Any]:
 def _is_pdf(doc_bytes: bytes, content_type: Optional[str]) -> bool:
     if content_type and "pdf" in content_type.lower():
         return True
-    # сигнатура %PDF
     return doc_bytes.startswith(b"%PDF")
 
 
 class ArcticTiltClient:
-    """Клиент к нашему GPU-серверу TILT (apps.tilt_api:app).
+    """Клиент к GPU-серверу TILT (apps.tilt_api:app).
 
     Делает три вещи:
-      1. Превращает bytes (PDF/PNG/JPEG) → список PIL.Image.
-      2. Гоняет OCR по каждой странице (PaddleX/PaddleOCR, CPU) → слова + bbox.
-      3. Формирует запрос /v1/tilt/generate и парсит JSON-ответ модели.
+      1) bytes (PDF/PNG/JPEG) → список PIL.Image.
+      2) OCR (PaddleX, CPU) → слова + bbox.
+      3) POST /v1/tilt/generate и возврат результата (как есть) + used_question.
     """
 
     def __init__(
@@ -138,7 +131,6 @@ class ArcticTiltClient:
         max_retries: int = 3,
         retry_backoff_s: float = 1.0,
         ocr_lang: str = "en",
-        question: Optional[str] = None,
         min_confidence: float = 0.3,
     ) -> None:
         self.base_url = _normalize_base_url(base_url)
@@ -149,72 +141,17 @@ class ArcticTiltClient:
         self.retry_backoff_s = retry_backoff_s
         self.ocr_lang = ocr_lang
         self.min_confidence = min_confidence
-       
-        RECEIPT_PROMPT_1 = """You are an information extraction engine for receipts.
-Given the OCR words with bounding boxes for a single page,
-extract the following fields from the receipt:
-- seller_name: the business or store name (usually at the top of the receipt, not "SALES RECEIPT").
-- invoice_date: the date of the purchase (usually near the bottom).
-- total_discount: the final total of all discounts applied to this receipt.
-- total_amount: the final amount the customer must pay after all discounts.
-- items: a list of purchased products or services from the body of the receipt.
-You MUST answer by filling this JSON template.
-Replace null values with the extracted values when possible.
-Use null if a field is missing or unclear.
-Output JSON only, with no extra text.
-{
-  "seller_name": null,
-  "invoice_date": null,
-  "total_discount": null,
-  "total_amount": null,
-  "items": []
-}
-"""
-        RECEIPT_PROMPT_1_2 = """You are an information extraction engine for receipts.
+        self.question = os.getenv("TILT_KIE_PROMPT")
 
-From the OCR words with bounding boxes of a single receipt,
-extract the following fields:
-
-- seller_name: business or store name (top of the receipt, not "SALES RECEIPT").
-- invoice_date: date of purchase (DD/MM/YYYY or YYYY-MM-DD).
-- total_discount: final total of all discounts.
-- total_amount: final amount the customer must pay after all discounts.
-
-Answer in EXACTLY 4 lines, in this exact format:
-
-seller_name=<value or null>
-invoice_date=<value or null>
-total_discount=<number or null>
-total_amount=<number or null>
-
-Do not add any other text, explanations or JSON.
-"""
-
-        RECEIPT_PROMPT_2 = """You are an information extraction engine for receipts.
-
-From the OCR words of this receipt, find the FINAL total amount
-that the customer must pay AFTER all discounts.
-It is usually labeled "Total:" near the bottom above the payment method.
-
-Answer with a single JSON object:
-{"total_amount": <number>}
-
-Use a dot as decimal separator. Do not include currency symbols.
-Output JSON only. """
-
-
-
-        # Вопрос к TILT по умолчанию: извлечение реквизитов чека/квитанции в JSON.
-        self.question = question or os.getenv(
-            "TILT_KIE_PROMPT",
-            RECEIPT_PROMPT_1_2,
+        obs.log_event(
+            "INFO",
+            "client.init",
+            msg="TILT client initialized",
+            tilt={"base_url": self.base_url, "model": self.model, "timeout_s": self.timeout},
         )
-        logger.info("TILT KIE question (first 200 chars): %r", self.question)
 
-        # HTTP-клиент к tilt_api
         self._cli = httpx.Client(timeout=self.timeout)
 
-        # OCR и связанные ошибки
         self._ocr: Any = None
         self._ocr_err: Optional[Exception] = None
 
@@ -226,21 +163,18 @@ Output JSON only. """
     # ------------------------------------------------------------------ #
 
     def _init_ocr(self) -> None:
-        """Инициализация OCR-пайплайна (PaddleX)."""
         if create_pipeline is None:
             self._ocr_err = RuntimeError("paddlex is not installed")
-            logger.error("paddlex import failed: paddlex is not installed")
+            obs.log_event("ERROR", "client.ocr_init_failed", msg="paddlex import failed")
             return
         try:
-            # общий OCR-пайплайн: детекция + распознавание
             self._ocr = create_pipeline(pipeline="OCR")
-            logger.info("PaddleX OCR pipeline initialized")
+            obs.log_event("INFO", "client.ocr_init_ok")
         except Exception as exc:  # noqa: BLE001
             self._ocr_err = exc
-            logger.exception("Failed to initialize PaddleX OCR pipeline")
+            obs.log_event("ERROR", "client.ocr_init_failed", msg=str(exc), error={"type": type(exc).__name__})
 
     def _ensure_ocr(self) -> None:
-        """Гарантирует, что OCR инициализирован (или есть сохранённая ошибка)."""
         if self._ocr is not None or self._ocr_err is not None:
             return
         self._init_ocr()
@@ -249,55 +183,72 @@ Output JSON only. """
     # HTTP к tilt_api
     # ------------------------------------------------------------------ #
 
-    def _headers(self) -> Dict[str, str]:
+    def _headers(self, request_id: Optional[str]) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if request_id:
+            headers["X-Request-ID"] = request_id
         return headers
 
-    def _post_tilt(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _post_tilt(self, payload: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         url = f"{self.base_url}/tilt/generate"
         last_exc: Optional[Exception] = None
         last_body: Optional[str] = None
 
         for attempt in range(1, self.max_retries + 1):
+            t0 = time.time()
             try:
-                logger.info(
-                    "Calling TILT at %s (attempt %d), pages=%d",
-                    url,
-                    attempt,
-                    len(payload.get("pages", [])),
+                obs.log_event(
+                    "INFO",
+                    "client.tilt_request_start",
+                    request_id=request_id,
+                    tilt={"url": url, "attempt": attempt, "pages": len(payload.get("pages", []))},
+                    prompt={"chars": len(payload.get("question") or "")},
                 )
-                resp = self._cli.post(url, json=payload, headers=self._headers())
+                resp = self._cli.post(url, json=payload, headers=self._headers(request_id))
                 resp.raise_for_status()
+                dt = time.time() - t0
+                obs.log_event(
+                    "INFO",
+                    "client.tilt_request_done",
+                    request_id=request_id,
+                    duration_ms=round(dt * 1000, 2),
+                    http={"status": resp.status_code},
+                    tilt={"response_chars": len(resp.text or "")},
+                )
                 return resp.json()
             except Exception as e:  # noqa: BLE001
+                dt = time.time() - t0
                 last_exc = e
                 body = None
+                status = None
                 if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                    status = e.response.status_code
                     try:
                         body = e.response.text
                     except Exception:
                         body = "<failed to read response body>"
                 last_body = body
-                logger.warning(
-                    "TILT request failed (attempt %d/%d): %r, body=%s",
-                    attempt,
-                    self.max_retries,
-                    e,
-                    body,
+
+                obs.log_event(
+                    "WARNING",
+                    "client.tilt_request_failed",
+                    request_id=request_id,
+                    duration_ms=round(dt * 1000, 2),
+                    http={"status": status},
+                    error={"type": type(e).__name__, "message": str(e)},
                 )
+
                 # HTTP 4xx повторять смысла нет
-                if isinstance(e, httpx.HTTPStatusError) and 400 <= e.response.status_code < 500:  # type: ignore[union-attr]
+                if isinstance(e, httpx.HTTPStatusError) and e.response is not None and 400 <= e.response.status_code < 500:
                     break
                 if attempt >= self.max_retries:
                     break
                 time.sleep(self.retry_backoff_s)
 
         if last_exc is not None:
-            raise RuntimeError(
-                f"Error calling {url}: {last_exc} (response_body={last_body})"
-            ) from last_exc
+            raise RuntimeError(f"Error calling {url}: {last_exc} (response_body={last_body})") from last_exc
         raise RuntimeError(f"Unknown error calling {url}")
 
     # ------------------------------------------------------------------ #
@@ -308,23 +259,14 @@ Output JSON only. """
         if pdfium is None or Image is None:
             raise RuntimeError("pypdfium2 and Pillow are required for PDF support")
 
-        try:
-            pdf = pdfium.PdfDocument(io.BytesIO(doc_bytes))  # type: ignore[arg-type]
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"Failed to open PDF: {exc}") from exc
+        pdf = pdfium.PdfDocument(io.BytesIO(doc_bytes))  # type: ignore[arg-type]
 
         images: List["Image.Image"] = []
-        try:
-            page_indices = list(range(len(pdf)))
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"Failed to enumerate PDF pages: {exc}") from exc
+        page_indices = list(range(len(pdf)))
 
         for i in page_indices:
             page = pdf[i]
-            try:
-                pil_image = page.render(scale=2.0).to_pil()  # type: ignore[no-untyped-call]
-            except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(f"Failed to render PDF page {i}: {exc}") from exc
+            pil_image = page.render(scale=2.0).to_pil()  # type: ignore[no-untyped-call]
             images.append(pil_image.convert("RGB"))
 
         if not images:
@@ -334,16 +276,10 @@ Output JSON only. """
     def _image_bytes_to_images(self, doc_bytes: bytes) -> List["Image.Image"]:
         if Image is None:
             raise RuntimeError("Pillow is required for image support")
-        try:
-            img = Image.open(io.BytesIO(doc_bytes))
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"Failed to open image: {exc}") from exc
 
+        img = Image.open(io.BytesIO(doc_bytes))
         images: List["Image.Image"] = []
-        try:
-            n_frames = getattr(img, "n_frames", 1)
-        except Exception:
-            n_frames = 1
+        n_frames = getattr(img, "n_frames", 1)
 
         for frame_idx in range(n_frames):
             try:
@@ -351,18 +287,13 @@ Output JSON only. """
                     img.seek(frame_idx)
                 images.append(img.convert("RGB"))
             except Exception:
-                # в крайнем случае берём только первый кадр
                 if not images:
                     images.append(img.convert("RGB"))
                 break
 
         return images
 
-    def _doc_bytes_to_images(
-        self,
-        doc_bytes: bytes,
-        content_type: Optional[str],
-    ) -> List["Image.Image"]:
+    def _doc_bytes_to_images(self, doc_bytes: bytes, content_type: Optional[str]) -> List["Image.Image"]:
         if _is_pdf(doc_bytes, content_type):
             return self._pdf_to_images(doc_bytes)
         return self._image_bytes_to_images(doc_bytes)
@@ -372,72 +303,48 @@ Output JSON only. """
     # ------------------------------------------------------------------ #
 
     def _run_ocr(self, img: "Image.Image") -> Tuple[int, int, List[Dict[str, Any]]]:
-        """
-        Запускает PaddleX OCR для одного изображения и возвращает:
-          - width, height картинки
-          - список слов вида {"text": str, "bbox": [x1, y1, x2, y2], "score": float}
-        """
         self._ensure_ocr()
         if self._ocr_err is not None or self._ocr is None:
             raise RuntimeError(f"OCR initialization failed: {self._ocr_err!r}")
-
         if Image is None:
             raise RuntimeError("Pillow is required for OCR images")
 
-        # Приводим к приемлемому формату
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
 
         w, h = img.size
 
-        # PaddleX принимает путь к файлу или np.ndarray.
-        # Используем временный PNG — самый простой и стабильный вариант.
         fd, tmp_path = tempfile.mkstemp(suffix=".png")
         os.close(fd)
         try:
             img.save(tmp_path, format="PNG")
-            raw_out_gen = self._ocr.predict(
-                tmp_path,
-                use_doc_orientation_classify=False,
-                )
+            raw_out_gen = self._ocr.predict(tmp_path, use_doc_orientation_classify=False)
             raw_out = list(raw_out_gen)
         finally:
             try:
                 os.remove(tmp_path)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
         if not raw_out:
-            logger.warning("PaddleOCR/PaddleX returned empty output list")
             return w, h, []
 
         page0 = raw_out[0]
 
-        # В разных версиях PaddleX:
-        #   - page0.res — объект с полем res
-        #   - {"res": ...} — словарь
-        #   - OCRResult — объект результата без явного поля res
         if hasattr(page0, "res"):
             res = page0.res
         elif isinstance(page0, dict) and "res" in page0:
             res = page0["res"]
         else:
-            logger.warning(
-                "Unexpected OCR output type: %r; using object itself as result",
-                type(page0),
-            )
             res = page0
 
-        # Если res — не dict, но обычный объект, пробуем взять его __dict__
         if hasattr(res, "__dict__") and not isinstance(res, dict):
             res = res.__dict__
 
         if not isinstance(res, dict):
-            logger.warning("OCR .res is not a dict-like object: %r", type(res))
             return w, h, []
 
         def _first_nonempty(keys: Tuple[str, ...]):
-            """Аккуратно берём первое непустое значение без bool(np.array)."""
             for key in keys:
                 if key not in res:
                     continue
@@ -445,7 +352,6 @@ Output JSON only. """
                 if val is None:
                     continue
                 try:
-                    # Пустые списки / строки / numpy-массивы считаем "пустыми"
                     if np is not None and isinstance(val, np.ndarray):
                         if val.size == 0:
                             continue
@@ -453,31 +359,26 @@ Output JSON only. """
                         if len(val) == 0:
                             continue
                 except Exception:
-                    # На всякий случай ничего не ломаем
                     pass
                 return val
             return None
 
-        # PaddleX 3.x: чаще всего используются эти ключи
         boxes = _first_nonempty(("rec_boxes", "dt_polys", "det_boxes", "boxes"))
         texts = _first_nonempty(("rec_texts", "rec_text", "texts"))
         scores = _first_nonempty(("rec_scores", "rec_score", "scores"))
 
         if boxes is None or texts is None:
-            logger.warning("OCR result has no boxes/texts keys: keys=%s", list(res.keys()))
             return w, h, []
 
-        # Приводим боксы к numpy для удобства (если есть numpy)
         if np is not None:
             try:
                 boxes_arr = np.array(boxes)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 boxes_arr = boxes
         else:
             boxes_arr = boxes
 
         out_words: List[Dict[str, Any]] = []
-
         for idx, (box, text) in enumerate(zip(boxes_arr, texts)):
             if not text:
                 continue
@@ -486,13 +387,12 @@ Output JSON only. """
             if scores is not None and idx < len(scores):
                 try:
                     score = float(scores[idx])
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
 
             if score < self.min_confidence:
                 continue
 
-            # Нормализуем bbox к [x1, y1, x2, y2]
             try:
                 if np is not None and isinstance(box, np.ndarray):
                     pts = box.reshape(-1, 2)
@@ -501,7 +401,6 @@ Output JSON only. """
                     x2 = float(pts[:, 0].max())
                     y2 = float(pts[:, 1].max())
                 else:
-                    # Может быть список из 4 чисел или список точек [[x, y], ...]
                     if (
                         isinstance(box, (list, tuple))
                         and len(box) == 4
@@ -513,28 +412,15 @@ Output JSON only. """
                         xs = [float(p[0]) for p in pts]
                         ys = [float(p[1]) for p in pts]
                         x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
-            except Exception:  # noqa: BLE001
-                logger.debug("Failed to normalize OCR box #%d: %r", idx, box, exc_info=True)
+            except Exception:
                 continue
 
-            out_words.append(
-                {
-                    "text": str(text),
-                    "bbox": [x1, y1, x2, y2],
-                    "score": float(score),
-                }
-            )
+            out_words.append({"text": str(text), "bbox": [x1, y1, x2, y2], "score": float(score)})
+
         return w, h, out_words
 
     # ------------------------------------------------------------------ #
-    # Парсинг ответа модели
-    # ------------------------------------------------------------------ #
-
-    def _parse_response(self, content: str) -> Dict[str, Any]:
-        return _extract_json_from_text(content)
-
-    # ------------------------------------------------------------------ #
-    # Подготовка кадидатов значений для внедрения в промпт
+    # Candidate builder (anchors → value to the right)
     # ------------------------------------------------------------------ #
 
     def _norm_token(self, s: str) -> str:
@@ -554,14 +440,9 @@ Output JSON only. """
         return abs(self._bbox_mid_y(bbox1) - self._bbox_mid_y(bbox2)) <= y_tol_px
 
     def _is_right_of_anchor(self, anchor_bbox: List[float], cand_bbox: List[float]) -> bool:
-        # cand левым краем должен быть правее правого края anchor (с небольшим допуском)
         return float(cand_bbox[0]) >= float(anchor_bbox[2]) - 2.0
 
     def _find_phrase_anchors(self, words: List[Dict[str, Any]], w1: str, w2: str) -> List[int]:
-        """
-        Ищем фразу (w1 w2) как два соседних токена: w1 слева от w2 на одной линии.
-        Возвращаем индекс второго токена (w2) как anchor (чтобы "справа" работало одинаково).
-        """
         w1n = self._norm_token(w1)
         w2n = self._norm_token(w2)
 
@@ -588,11 +469,6 @@ Output JSON only. """
         return out
 
     def _find_anchor_indices_for_tier(self, words: List[Dict[str, Any]], tier: List[Any]) -> List[int]:
-        """
-        Tier — список паттернов:
-        - str: совпадение по токену
-        - tuple(str,str): фраза из двух токенов (сосед слева + токен)
-        """
         idxs: List[int] = []
         tier_token_norm = {self._norm_token(x) for x in tier if isinstance(x, str)}
 
@@ -605,19 +481,18 @@ Output JSON only. """
             if isinstance(pat, tuple) and len(pat) == 2:
                 idxs.extend(self._find_phrase_anchors(words, pat[0], pat[1]))
 
-        # уникализация + сортировка
         return sorted(set(idxs))
 
-    def _select_anchor_indices_by_priority(self, words: List[Dict[str, Any]], field_name: str) -> List[int]:
+    def _select_anchor_indices_by_priority(self, words: List[Dict[str, Any]], field_name: str) -> Tuple[List[int], Optional[str]]:
         tiers = FIELD_ANCHOR_TIERS.get(field_name)
         if not tiers:
-            return []
+            return [], None
 
-        for tier in tiers:
+        for tier_i, tier in enumerate(tiers, start=1):
             idxs = self._find_anchor_indices_for_tier(words, tier)
             if idxs:
-                return idxs  # первый непустой tier выигрывает
-        return []
+                return idxs, str(tier_i)
+        return [], None
 
     def _candidate_from_anchor(self, words: List[Dict[str, Any]], anchor_i: int, max_neighbours: int) -> Optional[str]:
         anchor_bbox = words[anchor_i].get("bbox")
@@ -626,7 +501,6 @@ Output JSON only. """
 
         y_tol = max(8.0, 0.8 * self._bbox_h(anchor_bbox))
 
-        # 1) первый токен справа с цифрой
         start_j: Optional[int] = None
         for j in range(anchor_i + 1, len(words)):
             t = (words[j].get("text") or "").strip()
@@ -645,7 +519,6 @@ Output JSON only. """
         if start_j is None:
             return None
 
-        # 2) склейка MAX_NEIGHBOURS токенов начиная со start_j
         parts: List[str] = []
         for j in range(start_j, min(len(words), start_j + max_neighbours)):
             t = (words[j].get("text") or "").strip()
@@ -660,7 +533,6 @@ Output JSON only. """
 
         if not parts:
             return None
-
         return "".join(parts)
 
     def _collect_candidates_from_pages(
@@ -669,13 +541,11 @@ Output JSON only. """
         field_name: str,
         max_candidates: int,
         max_neighbours: int,
-    ) -> List[str]:
-        """
-        Кандидат = 1 anchor. Кол-во кандидатов = кол-ву найденных anchors (в выбранном tier),
-        но ограничиваем сверху max_candidates.
-        """
+    ) -> Tuple[List[str], Optional[str], int]:
         out: List[str] = []
         remaining = max_candidates
+        anchors_total = 0
+        tier_selected: Optional[str] = None
 
         for p in pages_payload:
             ocr = (p or {}).get("ocr") or {}
@@ -683,22 +553,25 @@ Output JSON only. """
             if not words:
                 continue
 
-            anchor_idxs = self._select_anchor_indices_by_priority(words, field_name)
+            anchor_idxs, tier = self._select_anchor_indices_by_priority(words, field_name)
+            if tier_selected is None:
+                tier_selected = tier
+            anchors_total += len(anchor_idxs)
+
             for ai in anchor_idxs:
                 if remaining <= 0:
-                    return out
+                    return out, tier_selected, anchors_total
                 cand = self._candidate_from_anchor(words, ai, max_neighbours=max_neighbours)
                 if cand is not None:
                     out.append(cand)
                     remaining -= 1
 
-        return out
+        return out, tier_selected, anchors_total
 
     def _inject_candidates_into_question(self, base_question: str, candidates: List[str]) -> str:
         if not candidates:
             return base_question
 
-        # JSON-массив строк — самый стабильный формат для "копировать без изменений"
         arr = "[" + ",".join(json.dumps(c) for c in candidates) + "]"
 
         if CANDIDATES_PLACEHOLDER in base_question:
@@ -711,28 +584,24 @@ Output JSON only. """
             + "\nOutput only the chosen string."
         )
 
-    def _build_pages_payload(
-        self, 
-        images: Any,
-    ) -> List[Dict[str, Any]]:
+    def _build_pages_payload(self, images: List["Image.Image"], request_id: Optional[str]) -> Tuple[List[Dict[str, Any]], int]:
         pages_payload: List[Dict[str, Any]] = []
         total_words = 0
+
         for page_idx, img in enumerate(images):
+            t0 = time.time()
             w, h, words = self._run_ocr(img)
+            dt = time.time() - t0
+
             total_words += len(words)
-            logger.info(
-                "TILT client OCR: page %d -> size=(%d x %d), words=%d",
-                page_idx,
-                w,
-                h,
-                len(words),
+            obs.log_event(
+                "INFO",
+                "client.ocr_page_done",
+                request_id=request_id,
+                duration_ms=round(dt * 1000, 2),
+                ocr={"page_idx": page_idx, "width": w, "height": h, "words": len(words)},
             )
-            if words:
-                logger.debug(
-                    "TILT client OCR: page %d, first 5 words: %s",
-                    page_idx,
-                    [w_["text"] for w_ in words[:5]],
-                )
+
             ocr_page = {
                 "width": int(w),
                 "height": int(h),
@@ -741,14 +610,12 @@ Output JSON only. """
             pages_payload.append({"ocr": ocr_page})
 
         if not total_words:
-            # Чтобы не выстрелить TILT'у по пустому
             raise RuntimeError("OCR produced zero words on all pages")
-        print(f'[infer] pages_payload={pages_payload}')
 
-        return pages_payload
+        return pages_payload, total_words
 
     # ------------------------------------------------------------------ #
-    # Публичный API
+    # Public API
     # ------------------------------------------------------------------ #
 
     def debug_candidates(
@@ -759,117 +626,150 @@ Output JSON only. """
         field_name: Optional[str] = None,
         max_candidates: Optional[int] = None,
         max_neighbours: Optional[int] = None,
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Прогоняет только OCR + сбор кандидатов + сбор used_question.
-        Модель НЕ вызывается.
-        """
-        # 1) делаем OCR тем же способом, что и в infer()
         images = self._doc_bytes_to_images(doc_bytes, content_type)
         if not images:
             raise RuntimeError("No pages produced from input document")
-        pages_payload = self._build_pages_payload(images)
+
+        pages_payload, total_words = self._build_pages_payload(images, request_id=request_id)
 
         base_question = question or self.question
+        if not base_question:
+            raise ValueError("question is required (pass question=... or set TILT_KIE_PROMPT)")
+
         used_question = base_question
         cands: List[str] = []
+        tier_selected: Optional[str] = None
+        anchors_total = 0
 
         if field_name and field_name in FIELD_ANCHOR_TIERS:
             mc = int(max_candidates) if max_candidates is not None else DEFAULT_MAX_CANDIDATES
             mn = int(max_neighbours) if max_neighbours is not None else DEFAULT_MAX_NEIGHBOURS
-            cands = self._collect_candidates_from_pages(pages_payload, field_name, mc, mn)
+            cands, tier_selected, anchors_total = self._collect_candidates_from_pages(pages_payload, field_name, mc, mn)
             used_question = self._inject_candidates_into_question(base_question, cands)
+
+        obs.log_event(
+            "INFO",
+            "client.candidates_built",
+            request_id=request_id,
+            field={"name": field_name, "tier": tier_selected},
+            candidates={"count": len(cands), "anchors_found": anchors_total},
+        )
 
         return {
             "field_name": field_name,
             "candidates": cands,
+            "tier": tier_selected,
+            "anchors_found": anchors_total,
             "used_question": used_question,
-            "pages_payload_preview": {
-                "num_pages": len(pages_payload),
-                "num_words_page0": len((pages_payload[0].get("ocr") or {}).get("words") or []) if pages_payload else 0,
-            },
+            "pages_payload_preview": {"num_pages": len(pages_payload), "words_total": total_words},
         }
 
     def infer(
-        self, 
-        doc_bytes: bytes, 
-        content_type: Optional[str] = None, 
+        self,
+        doc_bytes: bytes,
+        content_type: Optional[str] = None,
         question: Optional[str] = None,
         field_name: Optional[str] = None,
         max_candidates: Optional[int] = None,
         max_neighbours: Optional[int] = None,
-        ) -> Dict[str, Any]:
-        """Основной метод: bytes документа → dict с извлечёнными полями.
-
-        :param doc_bytes: содержимое загруженного файла (PDF/JPEG/PNG)
-        :param content_type: MIME-тип (для PDF более надёжное определение)
-        :param question: вопрос к TILT
-        """
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if MOCK:
-            # Упрощённый дубль для локальной отладки без TILT'а
-            return {
-                "mock": True,
-                "length_bytes": len(doc_bytes),
-                "content_type": content_type,
-            }
+            return {"mock": True, "length_bytes": len(doc_bytes), "content_type": content_type}
 
-        images = self._doc_bytes_to_images(doc_bytes, content_type)
+        obs.log_event(
+            "INFO",
+            "client.infer_start",
+            request_id=request_id,
+            doc={"content_type": content_type, "size_bytes": len(doc_bytes)},
+            field_name={"field_name": field_name},
+            question={"question": question},
+            
+        )
+
+        try:
+            images = self._doc_bytes_to_images(doc_bytes, content_type)
+        except Exception as e:
+            obs.log_event(
+                "ERROR",
+                "client._doc_bytes_to_images_failed",
+                request_id=request_id,
+                doc={"content_type": content_type, "size_bytes": len(doc_bytes)},
+                error={"type": type(e).__name__, "message": str(e)},
+            )
+            raise
+
         if not images:
+            obs.log_event(
+                "WARNING",
+                "client.doc_no_pages",
+                request_id=request_id,
+                doc={"content_type": content_type, "size_bytes": len(doc_bytes)},
+            )
             raise RuntimeError("No pages produced from input document")
-        
-        pages_payload = self._build_pages_payload(images)
 
-        
+        obs.log_event(
+            "INFO",
+            "client.doc_loaded",
+            request_id=request_id,
+            doc={"pages": len(images), "content_type": content_type, "size_bytes": len(doc_bytes)},
+        )
+
+        pages_payload, total_words = self._build_pages_payload(images, request_id=request_id)
 
         base_question = question or self.question
-        used_question = base_question
-        print(f"[tilt_client] field_name={field_name}, base_question={base_question}")
+        if not base_question:
+            raise ValueError("question is required (pass question=... or set TILT_KIE_PROMPT)")
 
-        if base_question is not None and field_name and field_name in FIELD_ANCHOR_TIERS:
-            print(f"[tilt_client] in if question...")
+        used_question = base_question
+
+        cands: List[str] = []
+        tier_selected: Optional[str] = None
+        anchors_total = 0
+
+        if field_name and field_name in FIELD_ANCHOR_TIERS:
             mc = int(max_candidates) if max_candidates is not None else DEFAULT_MAX_CANDIDATES
             mn = int(max_neighbours) if max_neighbours is not None else DEFAULT_MAX_NEIGHBOURS
-
-            cands = self._collect_candidates_from_pages(
-                pages_payload=pages_payload,
-                field_name=field_name,
-                max_candidates=mc,
-                max_neighbours=mn,
-            )
-            print(f"[tilt_client] cands={cands}")
-            
-            
+            cands, tier_selected, anchors_total = self._collect_candidates_from_pages(pages_payload, field_name, mc, mn)
             used_question = self._inject_candidates_into_question(base_question, cands)
 
+            obs.log_event(
+                "INFO",
+                "client.candidates_built",
+                request_id=request_id,
+                field={"name": field_name, "tier": tier_selected},
+                candidates={"count": len(cands), "anchors_found": anchors_total},
+            )
+
+        # payload includes request_id as a fallback channel (header is primary)
         payload: Dict[str, Any] = {
             "question": used_question,
             "pages": pages_payload,
             "model": self.model,
+            "request_id": request_id,
         }
-        print(f"[tilt_client] cands={cands}")
 
-        logger.info(
-            "Sending TILT request: pages=%d, cands=%d",
-            len(pages_payload),
-            cands
-            )
-        print(f'[tilt_client] payload={payload}')
+        obs.log_event(
+            "INFO",
+            "client.payload_ready",
+            request_id=request_id,
+            doc={"pages": len(pages_payload)},
+            ocr={"words_total": total_words},
+            field={"name": field_name, "mode": "candidates" if cands else "plain", "tier": tier_selected},
+            candidates={"count": len(cands)},
+            prompt={"chars": len(used_question or "")},
+        )
 
-        resp = self._post_tilt(payload)
-        print(f'[tilt_client] resp={resp}')
+        resp = self._post_tilt(payload, request_id=request_id)
 
         try:
             content = resp["choices"][0]["message"]["content"]
         except Exception as e:  # noqa: BLE001
-            raise RuntimeError(
-                f"Unexpected tilt_api response structure: {e}; got: {resp}"
-            ) from e
+            raise RuntimeError(f"Unexpected tilt_api response structure: {e}; got keys={list(resp.keys())}") from e
 
-        #return self._extract_json_from_text(content)
-        return {
-            'response':content, 
-            'used_question':used_question
-            }
+        return {"response": content, "used_question": used_question, "candidates": cands}
 
     def close(self) -> None:
         try:

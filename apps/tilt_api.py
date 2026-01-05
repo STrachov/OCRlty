@@ -5,19 +5,29 @@ FastAPI server for Arctic-TILT on vLLM.
 - Работает с OCR-only входом (слова + bbox). Если нет реальной картинки,
   создаётся белый dummy-Image нужного размера, чтобы TiltPreprocessor был доволен.
 - Один основной endpoint: POST /v1/tilt/generate
+
+Updates (2025-12):
+- X-Request-ID middleware (generate/proxy correlation id)
+- Structured JSON logging events
+- Prometheus /metrics with stage timers (preprocess / infer / total) and error counters
+- Use request_id to build vLLM request_id (instead of document.ident-q0)
+- Remove noisy prints, avoid logging full payloads / OCR content
 """
 
 from __future__ import annotations
 
 import base64
 import io
+import json
 import logging
 import os
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from PIL import Image  # type: ignore[import]
 
@@ -32,70 +42,110 @@ from vllm.multimodal.tilt_processor import (
 )
 from vllm.utils import FlexibleArgumentParser
 
-# -------------------------------------------------------------------------
-# Logging
-# -------------------------------------------------------------------------
 
-log = logging.getLogger("tilt_api")
-if not log.handlers:
-    logging.basicConfig(
-        level=os.getenv("LOGLEVEL", "INFO"),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+
+
+# -----------------------------------------------------------------------------
+# Logging (shared structured logger)
+# -----------------------------------------------------------------------------
+from lib.utils.logging import get_event_logger
+
+obs = get_event_logger("tilt_api", logger_name="tilt_api")
+
+# -------------------------------------------------------------------------
+# Prometheus metrics 
+# -------------------------------------------------------------------------
+PROMETHEUS_ENABLED = os.getenv("PROMETHEUS_ENABLED", "0") == "1"
+if PROMETHEUS_ENABLED:
+
+    from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+
+    HTTP_REQUESTS_TOTAL = Counter(
+        "http_requests_total",
+        "HTTP requests total",
+        ["service", "path", "method", "status"],
+    )
+    HTTP_REQUEST_DURATION = Histogram(
+        "http_request_duration_seconds",
+        "HTTP request duration (seconds)",
+        ["service", "path", "method"],
+        buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30),
+    )
+    TILT_STAGE_DURATION = Histogram(
+        "pipeline_stage_duration_seconds",
+        "Pipeline stage duration (seconds)",
+        ["stage"],
+        buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60),
+    )
+    TILT_ERRORS_TOTAL = Counter(
+        "pipeline_errors_total",
+        "Pipeline errors total",
+        ["stage", "error_code"],
     )
 
 # -------------------------------------------------------------------------
-# Конфиг из ENV
+# Config from ENV
 # -------------------------------------------------------------------------
 
 MODEL_NAME: str = os.getenv("TILT_MODEL", "Snowflake/snowflake-arctic-tilt-v1.3")
-
-# В examples/tilt_example.py используют bfloat16. На float16 мы уже ловили NaN.
-DTYPE: str = os.getenv("TILT_DTYPE", "bfloat16")  # "bfloat16" по умолчанию
-
+DTYPE: str = os.getenv("TILT_DTYPE", "bfloat16")
 TP_SIZE: int = int(os.getenv("TILT_TP", os.getenv("TILT_TP_SIZE", "1")))
 MAX_MODEL_LEN_ENV: Optional[str] = os.getenv("TILT_MAX_MODEL_LEN", None)
-
-GPU_UTIL: float = float(os.getenv("TILT_GPU_UTIL",
-                                  os.getenv("VLLM_GPU_UTIL", "0.9")))
-
+GPU_UTIL: float = float(os.getenv("TILT_GPU_UTIL", os.getenv("VLLM_GPU_UTIL", "0.9")))
 HF_CACHE_DIR: str = os.getenv("HF_HOME", "/workspace/cache/hf")
-ENFORCE_EAGER: bool = True  # как в примере; для TILT Long рекомендуют eager
-
+ENFORCE_EAGER: bool = True
 DEFAULT_TEMPERATURE: float = float(os.getenv("TILT_TEMPERATURE", "0.0"))
 DEFAULT_MAX_TOKENS: int = int(os.getenv("TILT_MAX_TOKENS", "256"))
 
-log.info(
-    "TILT config: model=%s, dtype=%s, tp=%s, gpu_util=%s",
-    MODEL_NAME,
-    DTYPE,
-    TP_SIZE,
-    GPU_UTIL,
+obs.log_event(
+    "INFO",
+    "gpu.startup_config",
+    msg="TILT config loaded",
+    tilt={"model": MODEL_NAME, "dtype": DTYPE, "tp_size": TP_SIZE, "gpu_util": GPU_UTIL},
 )
 
 # -------------------------------------------------------------------------
 # FastAPI app
 # -------------------------------------------------------------------------
 
-app = FastAPI(title="Arctic-TILT API", version="1.0")
+app = FastAPI(title="Arctic-TILT API", version="1.1")
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    rid = request.headers.get("x-request-id") or uuid.uuid4().hex
+    request.state.request_id = rid
+
+    start = time.time()
+    status_code = 500
+    try:
+        response: Response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-ID"] = rid
+        return response
+    finally:
+        dur = time.time() - start
+        obs.log_event(
+            "INFO",
+            "gpu.http_done",
+            request_id=rid,
+            http={"method": request.method, "path": request.url.path, "status": status_code},
+            duration_ms=round(dur * 1000, 2),
+        )
+        if PROMETHEUS_ENABLED:
+            HTTP_REQUESTS_TOTAL.labels("tilt_api", request.url.path, request.method, str(status_code)).inc()
+            HTTP_REQUEST_DURATION.labels("tilt_api", request.url.path, request.method).observe(dur)
+
 
 # -------------------------------------------------------------------------
-# vLLM Engine + TiltPreprocessor (как в tilt_example.py, но без CLI)
+# vLLM Engine + TiltPreprocessor
 # -------------------------------------------------------------------------
 
 
 def _build_llm_engine() -> Tuple[LLMEngine, TiltPreprocessor]:
-    """
-    Создаём LLMEngine и TiltPreprocessor, подавая аргументы через
-    AsyncEngineArgs.add_cli_args + EngineArgs.from_cli_args, как в examples/tilt_example.py.
-    """
-    parser = FlexibleArgumentParser(
-        description="Arctic-TILT vLLM engine (used behind FastAPI)."
-    )
-
-    # Добавляем все engine-параметры vLLM (как в примере):
+    parser = FlexibleArgumentParser(description="Arctic-TILT vLLM engine (behind FastAPI).")
     parser = AsyncEngineArgs.add_cli_args(parser, async_args_only=False)
 
-    # Значения по умолчанию, максимально близкие к tilt_example.py
     parser.set_defaults(
         model=MODEL_NAME,
         task="tilt_generate",
@@ -104,14 +154,10 @@ def _build_llm_engine() -> Tuple[LLMEngine, TiltPreprocessor]:
         dtype=DTYPE,
         max_num_seqs=16,
         enforce_eager=ENFORCE_EAGER,
-        # Не поддерживается V1-движком, но vLLM сам откатится на V0 и выведет warning.
         disable_async_output_proc=True,
     )
 
-    # Не хотим брать реальные аргументы командной строки uvicorn — парсим пустой список.
     args = parser.parse_args([])
-
-    # Донастраиваем некоторые поля из ENV
     args.tensor_parallel_size = TP_SIZE
     args.download_dir = HF_CACHE_DIR
 
@@ -119,13 +165,10 @@ def _build_llm_engine() -> Tuple[LLMEngine, TiltPreprocessor]:
         try:
             args.max_model_len = int(MAX_MODEL_LEN_ENV)
         except ValueError:
-            log.warning(
-                "Invalid TILT_MAX_MODEL_LEN=%s, ignoring.",
-                MAX_MODEL_LEN_ENV,
-            )
+            obs.log_event("WARNING", "gpu.config_invalid", msg=f"Invalid TILT_MAX_MODEL_LEN={MAX_MODEL_LEN_ENV}, ignoring.")
 
     engine_args = EngineArgs.from_cli_args(args)
-    log.info("Creating LLMEngine with task=%s", engine_args.task)
+    obs.log_event("INFO", "gpu.engine_create", msg=f"Creating LLMEngine task={engine_args.task}")
 
     llm_engine = LLMEngine.from_engine_args(engine_args)
 
@@ -142,59 +185,34 @@ llm_engine, preprocessor = _build_llm_engine()
 _engine_lock = threading.Lock()
 
 # -------------------------------------------------------------------------
-# Pydantic-модели входа
+# Pydantic request models
 # -------------------------------------------------------------------------
 
 
 class OCRWord(BaseModel):
     text: str = Field(..., description="Recognized token text")
-    bbox: List[float] = Field(
-        ...,
-        min_items=4,
-        max_items=4,
-        description="[x0,y0,x1,y1] in pixels",
-    )
+    bbox: List[float] = Field(..., min_items=4, max_items=4, description="[x0,y0,x1,y1] in pixels")
 
 
 class OCRPage(BaseModel):
     width: int = Field(..., description="Page width in pixels")
     height: int = Field(..., description="Page height in pixels")
-    words: List[OCRWord] = Field(
-        default_factory=list,
-        description="Words with absolute bboxes",
-    )
+    words: List[OCRWord] = Field(default_factory=list, description="Words with absolute bboxes")
 
 
 class InputPage(BaseModel):
-    ocr: Optional[OCRPage] = Field(
-        None,
-        description="OCR result with word boxes in pixels",
-    )
-    image_b64: Optional[str] = Field(
-        None,
-        description="Base64-encoded PNG/JPG of the page (optional).",
-    )
-    image_path: Optional[str] = Field(
-        None,
-        description="Path to page image inside container (optional).",
-    )
+    ocr: Optional[OCRPage] = Field(None, description="OCR result with word boxes in pixels")
+    image_b64: Optional[str] = Field(None, description="Base64-encoded PNG/JPG of the page (optional).")
+    image_path: Optional[str] = Field(None, description="Path to page image inside container (optional).")
 
 
 class TiltRequest(BaseModel):
     question: str = Field(..., description="Doc-VQA / KIE question or instruction")
-    pages: List[InputPage] = Field(
-        ..., description="List of pages with OCR and/or images"
-    )
-    model: Optional[str] = Field(
-        None,
-        description="Override model name (optional).",
-    )
-    temperature: Optional[float] = Field(
-        None, description="Overrides default temperature."
-    )
-    max_tokens: Optional[int] = Field(
-        None, description="Overrides default max tokens."
-    )
+    pages: List[InputPage] = Field(..., description="List of pages with OCR and/or images")
+    model: Optional[str] = Field(None, description="Override model name (optional).")
+    temperature: Optional[float] = Field(None, description="Overrides default temperature.")
+    max_tokens: Optional[int] = Field(None, description="Overrides default max tokens.")
+    request_id: Optional[str] = Field(None, description="Correlation id (optional)")
 
 
 # -------------------------------------------------------------------------
@@ -203,21 +221,19 @@ class TiltRequest(BaseModel):
 
 
 def _decode_image(page: InputPage) -> Image.Image:
-    """Получаем PIL.Image из image_b64 или image_path, либо создаём белую заглушку."""
     if page.image_b64:
         try:
             raw = base64.b64decode(page.image_b64)
             return Image.open(io.BytesIO(raw)).convert("RGB")
         except Exception as exc:  # noqa: BLE001
-            log.warning("Failed to decode image_b64: %s", exc)
+            obs.log_event("WARNING", "gpu.image_decode_failed", msg=str(exc))
 
     if page.image_path:
         try:
             return Image.open(page.image_path).convert("RGB")
         except Exception as exc:  # noqa: BLE001
-            log.warning("Failed to open image_path=%s: %s", page.image_path, exc)
+            obs.log_event("WARNING", "gpu.image_open_failed", msg=f"path={page.image_path} err={exc}")
 
-    # dummy: белый лист A4-ish
     return Image.new(mode="L", size=(768, 1086), color=255)
 
 
@@ -235,136 +251,104 @@ def _input_page_to_tilt_page(page: InputPage) -> Page:
             except Exception:  # noqa: BLE001
                 continue
     else:
-        # Если OCR нет — просто пустая страница с dummy-изображением
         width, height = img.size
         words = []
         bboxes = []
 
-    return Page(
-        words=words,
-        bboxes=bboxes,
-        width=width,
-        height=height,
-        image=img,
-    )
+    return Page(words=words, bboxes=bboxes, width=width, height=height, image=img)
 
 
-def _build_document(req: TiltRequest) -> Document:
-    doc_id = f"api-{int(time.time() * 1000)}"
+def _build_document(req: TiltRequest, request_id: str) -> Document:
+    doc_id = request_id
 
     tilt_pages: List[Page] = []
+    total_words = 0
     for idx, p in enumerate(req.pages):
         tilt_page = _input_page_to_tilt_page(p)
-        # Важно: если после OCR у страницы нет ни одного слова — TILT-пайплайн
-        # потом может развалиться с IndexError. Отфильтруем такие страницы.
         if not tilt_page.words:
-            log.warning(
-                "Skipping page %d: no OCR words (width=%s, height=%s)",
-                idx,
-                getattr(tilt_page, "width", None),
-                getattr(tilt_page, "height", None),
+            obs.log_event(
+                "WARNING",
+                "gpu.ocr_page_skipped",
+                request_id=request_id,
+                msg=f"Skipping page {idx}: no OCR words",
+                ocr={"page_idx": idx, "width": getattr(tilt_page, "width", None), "height": getattr(tilt_page, "height", None)},
             )
             continue
+        total_words += len(tilt_page.words)
         tilt_pages.append(tilt_page)
 
     if not tilt_pages:
-        # Явная, понятная ошибка вместо внутреннего IndexError в TiltPreprocessor
-        raise HTTPException(
-            status_code=400,
-            detail="No valid OCR words found on any page for TILT.",
-        )
+        raise HTTPException(status_code=400, detail="No valid OCR words found on any page for TILT.")
 
+    obs.log_event("INFO", "gpu.document_built", request_id=request_id, doc={"pages": len(tilt_pages)}, ocr={"words_total": total_words})
     return Document(ident=doc_id, split=None, pages=tilt_pages)
 
 
 def _build_questions(req: TiltRequest) -> List[Question]:
-    q_text = req.question.strip()
-    # В examples/tilt_example.py feature_name = key. У нас один вопрос, условно key="user_question".
-    return [Question(feature_name="user_question", text=q_text)]
+    return [Question(feature_name="user_question", text=req.question.strip())]
 
 
 # -------------------------------------------------------------------------
-# Core inference: один запрос через LLMEngine (с блокировкой)
+# Core inference
 # -------------------------------------------------------------------------
 
 
-def _run_tilt_inference(req: TiltRequest) -> Tuple[str, Optional[str]]:
-    """
-    Выполняет один запрос TILT через глобальный LLMEngine.
-
-    Возвращает:
-    - text: str        — финальный ответ модели (может быть пустым)
-    - debug_repr: str? — repr(RequestOutput) для дебага
-    """
+def _run_tilt_inference(req: TiltRequest, request_id: str) -> Tuple[str, Optional[str], Dict[str, Any]]:
     if not req.pages:
-        raise HTTPException(
-            status_code=400,
-            detail="Request must contain at least one page.",
-        )
+        raise HTTPException(status_code=400, detail="Request must contain at least one page.")
 
-    document = _build_document(req)
+    t0 = time.time()
+    document = _build_document(req, request_id=request_id)
     questions = _build_questions(req)
 
+    # preprocess
+    tp0 = time.time()
     try:
         samples = preprocessor.preprocess(document, questions)
     except IndexError as exc:
-        # Это как раз тот случай: page_token_ids пустые и т.п.
-        log.exception(
-            "TiltPreprocessor.preprocess raised IndexError. "
-            "Likely no tokens were produced from OCR / bboxes. "
-            "document_id=%s, num_pages=%d",
-            document.ident,
-            len(getattr(document, "pages", [])),
+        if PROMETHEUS_ENABLED:
+            TILT_ERRORS_TOTAL.labels("preprocess", "INDEX_ERROR").inc()
+        obs.log_event(
+            "ERROR",
+            "gpu.preprocess_failed",
+            request_id=request_id,
+            msg="IndexError in TiltPreprocessor.preprocess (likely no tokens produced from OCR/bboxes).",
+            error={"type": "IndexError", "message": str(exc)},
         )
-        raise HTTPException(
-            status_code=500,
-            detail="TILT preprocessing failed: no page tokens produced from OCR.",
-        ) from exc
+        raise HTTPException(status_code=500, detail="TILT preprocessing failed: no page tokens produced from OCR.") from exc
     except Exception as exc:  # noqa: BLE001
-        log.exception("TiltPreprocessor.preprocess failed: %s", exc)
-        raise HTTPException(
-            status_code=500,
-            detail=f"TILT preprocessing failed: {exc}",
-        ) from exc
+        if PROMETHEUS_ENABLED:
+            TILT_ERRORS_TOTAL.labels("preprocess", "EXCEPTION").inc()
+        obs.log_event(
+            "ERROR",
+            "gpu.preprocess_failed",
+            request_id=request_id,
+            msg="TiltPreprocessor.preprocess failed.",
+            error={"type": type(exc).__name__, "message": str(exc)},
+        )
+        raise HTTPException(status_code=500, detail=f"TILT preprocessing failed: {exc}") from exc
+
+    preprocess_s = time.time() - tp0
+    if PROMETHEUS_ENABLED:
+        TILT_STAGE_DURATION.labels("preprocess").observe(preprocess_s)
 
     if not samples:
-        log.warning(
-            "TiltPreprocessor.preprocess returned empty samples, "
-            "document_id=%s, num_pages=%d",
-            document.ident,
-            len(getattr(document, "pages", [])),
-        )
-        return "", None
+        obs.log_event("WARNING", "gpu.preprocess_empty", request_id=request_id, msg="preprocess returned empty samples")
+        return "", None, {"preprocess_s": preprocess_s, "infer_s": 0.0, "total_s": time.time() - t0}
 
     sample = samples[0]
 
-    temperature = (
-        req.temperature
-        if req.temperature is not None
-        else DEFAULT_TEMPERATURE
-    )
-    max_tokens = (
-        req.max_tokens
-        if req.max_tokens is not None
-        else DEFAULT_MAX_TOKENS
-    )
+    temperature = req.temperature if req.temperature is not None else DEFAULT_TEMPERATURE
+    max_tokens = req.max_tokens if req.max_tokens is not None else DEFAULT_MAX_TOKENS
+    sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens, logprobs=0)
 
-    sampling_params = SamplingParams(
-        temperature=temperature,
-        max_tokens=max_tokens,
-        logprobs=0,  # TILT task ожидает logprobs
-    )
+    vllm_request_id = f"{request_id}-q0"
 
-    request_id = f"{document.ident}-q0"
+    infer0 = time.time()
     final_output = None
 
-    # синхронный доступ к движку: один request за раз
     with _engine_lock:
-        llm_engine.add_request(
-            prompt=sample,
-            request_id=request_id,
-            params=sampling_params,
-        )
+        llm_engine.add_request(prompt=sample, request_id=vllm_request_id, params=sampling_params)
 
         while True:
             request_outputs = llm_engine.step()
@@ -372,7 +356,7 @@ def _run_tilt_inference(req: TiltRequest) -> Tuple[str, Optional[str]]:
                 continue
 
             for out in request_outputs:
-                if out.request_id != request_id:
+                if out.request_id != vllm_request_id:
                     continue
                 if not out.finished:
                     continue
@@ -382,14 +366,22 @@ def _run_tilt_inference(req: TiltRequest) -> Tuple[str, Optional[str]]:
             if final_output is not None:
                 break
 
+    infer_s = time.time() - infer0
+    if PROMETHEUS_ENABLED:
+        TILT_STAGE_DURATION.labels("infer").observe(infer_s)
+
     if final_output is None:
-        log.warning("No RequestOutput for request_id=%s", request_id)
-        return "", None
+        if PROMETHEUS_ENABLED:
+            TILT_ERRORS_TOTAL.labels("infer", "NO_OUTPUT").inc()
+        obs.log_event("WARNING", "gpu.infer_no_output", request_id=request_id, msg="No RequestOutput produced")
+        return "", None, {"preprocess_s": preprocess_s, "infer_s": infer_s, "total_s": time.time() - t0}
 
     outputs = getattr(final_output, "outputs", None) or []
     if not outputs:
-        log.warning("RequestOutput.outputs is empty for request_id=%s", request_id)
-        return "", repr(final_output)
+        if PROMETHEUS_ENABLED:
+            TILT_ERRORS_TOTAL.labels("infer", "EMPTY_OUTPUTS").inc()
+        obs.log_event("WARNING", "gpu.infer_empty_outputs", request_id=request_id, msg="RequestOutput.outputs is empty")
+        return "", repr(final_output), {"preprocess_s": preprocess_s, "infer_s": infer_s, "total_s": time.time() - t0}
 
     first = outputs[0]
     debug_repr = repr(first)
@@ -397,16 +389,35 @@ def _run_tilt_inference(req: TiltRequest) -> Tuple[str, Optional[str]]:
     try:
         text = first.text
     except Exception as exc:  # noqa: BLE001
-        log.warning("Failed to read text from outputs[0]: %s", exc)
-        return "", debug_repr
+        if PROMETHEUS_ENABLED:
+            TILT_ERRORS_TOTAL.labels("infer", "TEXT_READ_FAILED").inc()
+        obs.log_event("WARNING", "gpu.infer_text_read_failed", request_id=request_id, msg=str(exc))
+        return "", debug_repr, {"preprocess_s": preprocess_s, "infer_s": infer_s, "total_s": time.time() - t0}
 
     if not isinstance(text, str):
         text = str(text)
 
     text = text.strip()
-    log.info("TILT output text=%r", text)
+    total_s = time.time() - t0
+    if PROMETHEUS_ENABLED:
+        TILT_STAGE_DURATION.labels("total").observe(total_s)
 
-    return text, debug_repr
+    preview = text[:160]
+    obs.log_event(
+        "INFO",
+        "gpu.infer_done",
+        request_id=request_id,
+        tilt={
+            "model": req.model or MODEL_NAME,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "output_chars": len(text),
+            "output_preview": preview,
+        },
+        duration_ms=round(total_s * 1000, 2),
+    )
+
+    return text, debug_repr, {"preprocess_s": preprocess_s, "infer_s": infer_s, "total_s": total_s}
 
 
 # -------------------------------------------------------------------------
@@ -415,50 +426,45 @@ def _run_tilt_inference(req: TiltRequest) -> Tuple[str, Optional[str]]:
 
 
 @app.post("/v1/tilt/generate")
-def tilt_generate(req: TiltRequest = Body(...)) -> Dict[str, Any]:
-    """
-    Основной endpoint: принимает question + pages[ocr/image] и возвращает
-    OpenAI-подобный ответ с полем raw.output_repr для дебага.
-    """
-    print("Welcome!")
+def tilt_generate(
+    req: TiltRequest = Body(...),
+    request: Request = None,
+    x_request_id: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    rid = x_request_id or getattr(getattr(request, "state", None), "request_id", None) or req.request_id or uuid.uuid4().hex
+
+    obs.log_event("INFO", "gpu.request_received", request_id=rid, doc={"pages_in": len(req.pages)}, tilt={"model": req.model or MODEL_NAME})
+
     try:
-        text, debug_repr = _run_tilt_inference(req)
+        text, debug_repr, meta = _run_tilt_inference(req, request_id=rid)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
-        log.exception("Error during TILT inference: %s", exc)
+        if PROMETHEUS_ENABLED:
+            TILT_ERRORS_TOTAL.labels("total", "UNHANDLED").inc()
+        obs.log_event("ERROR", "gpu.unhandled_error", request_id=rid, error={"type": type(exc).__name__, "message": str(exc)})
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return {
-        "id": "tiltcmpl-1",
+        "id": f"tiltcmpl-{rid}",
         "object": "chat.completion",
         "model": req.model or MODEL_NAME,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": None,
-            "completion_tokens": None,
-            "total_tokens": None,
-        },
-        "raw": {"output_repr": debug_repr} if debug_repr is not None else None,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
+        "raw": {"output_repr": debug_repr, "meta": meta} if debug_repr is not None else {"meta": meta},
     }
 
 
 @app.get("/v1/health")
-def health() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "model": MODEL_NAME,
-        "dtype": DTYPE,
-        "gpu_util": GPU_UTIL,
-        "tp_size": TP_SIZE,
-    }
+def health(request: Request) -> Dict[str, Any]:
+    rid = getattr(getattr(request, "state", None), "request_id", None) or uuid.uuid4().hex
+    obs.log_event("INFO", "gpu.health", request_id=rid)
+    return {"status": "ok", "model": MODEL_NAME, "dtype": DTYPE, "gpu_util": GPU_UTIL, "tp_size": TP_SIZE}
 
 
-# (опционально можно было бы добавить warmup, но с учётом тяжёлой модели
-#  лучше не стартовать лишний инференс на импорт модуля)
+@app.get("/metrics")
+def metrics() -> Response:
+    if not PROMETHEUS_ENABLED:
+        return PlainTextResponse("PROMETHEUS_ENABLED=0\n", status_code=404)
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
