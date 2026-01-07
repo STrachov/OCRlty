@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 
 from lib.pipelines.tilt_client import ArcticTiltClient
 from lib.post.rules import postprocess_rules  # теперь обязательная зависимость
@@ -22,7 +22,7 @@ from lib.post.rules import postprocess_rules  # теперь обязатель�
 # -----------------------------------------------------------------------------
 from lib.utils.logging import get_event_logger
 
-obs = get_event_logger("api", logger_name="api")
+obs = get_event_logger("api")
 
 # -----------------------------------------------------------------------------
 # Prometheus metrics
@@ -162,9 +162,10 @@ async def request_id_and_metrics(request: Request, call_next):
 
     t0 = time.perf_counter()
     status = 500
+
     try:
         response = await call_next(request)
-        status = response.status_code
+        status = int(getattr(response, "status_code", 200))
     except HTTPException as e:
         status = int(e.status_code)
         obs.log_event(
@@ -174,7 +175,7 @@ async def request_id_and_metrics(request: Request, call_next):
             http={"method": method, "path": path, "status": status},
             error={"type": "HTTPException", "message": str(e.detail)},
         )
-        raise
+        response = JSONResponse(status_code=status, content={"detail": e.detail})
     except Exception as e:  # noqa: BLE001
         status = 500
         obs.log_event(
@@ -184,7 +185,7 @@ async def request_id_and_metrics(request: Request, call_next):
             http={"method": method, "path": path, "status": status},
             error={"type": type(e).__name__, "message": str(e)},
         )
-        raise
+        response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"}) #TODO: replace the string with e?
     finally:
         dt = time.perf_counter() - t0
         if PROMETHEUS_ENABLED:
@@ -200,7 +201,7 @@ async def request_id_and_metrics(request: Request, call_next):
             duration_ms=round(dt * 1000.0, 3),
         )
 
-    # Add correlation header
+    # Add correlation header (always)
     response.headers["X-Request-ID"] = request_id
     return response
 
@@ -263,6 +264,12 @@ async def extract(
         raise HTTPException(status_code=503, detail="Model client not initialized")
 
     request_id: str = getattr(request.state, "request_id", uuid.uuid4().hex)
+
+    # If question is not provided, require env default to be set
+    if not question and not os.getenv("TILT_KIE_PROMPT"):
+        if PROMETHEUS_ENABLED:
+            PIPELINE_ERRORS_TOTAL.labels("api", "MISSING_QUESTION").inc()
+        raise HTTPException(status_code=400, detail="Missing 'question' (and TILT_KIE_PROMPT is not set)")
 
     # read file bytes early to compute size
     content = await file.read()

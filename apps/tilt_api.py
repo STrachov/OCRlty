@@ -50,7 +50,7 @@ from vllm.utils import FlexibleArgumentParser
 # -----------------------------------------------------------------------------
 from lib.utils.logging import get_event_logger
 
-obs = get_event_logger("tilt_api", logger_name="tilt_api")
+obs = get_event_logger("tilt_api")
 
 # -------------------------------------------------------------------------
 # Prometheus metrics 
@@ -234,7 +234,12 @@ def _decode_image(page: InputPage) -> Image.Image:
         except Exception as exc:  # noqa: BLE001
             obs.log_event("WARNING", "gpu.image_open_failed", msg=f"path={page.image_path} err={exc}")
 
-    return Image.new(mode="L", size=(768, 1086), color=255)
+
+    # Fallback: create a blank image matching OCR canvas if available
+    if page.ocr and page.ocr.width and page.ocr.height:
+        return Image.new(mode="RGB", size=(page.ocr.width, page.ocr.height), color=(255, 255, 255))
+
+    return Image.new(mode="RGB", size=(768, 1086), color=(255, 255, 255))
 
 
 def _input_page_to_tilt_page(page: InputPage) -> Page:

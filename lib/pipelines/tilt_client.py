@@ -12,7 +12,7 @@ import httpx
 
 from lib.utils.logging import get_event_logger  # shared structured logger
 
-obs = get_event_logger("tilt_client", logger_name=__name__)
+obs = get_event_logger("tilt_client")
 
 # Опциональные тяжёлые зависимости: используем ленивый импорт
 try:  # Pillow для работы с изображениями
@@ -416,6 +416,8 @@ class ArcticTiltClient:
                 continue
 
             out_words.append({"text": str(text), "bbox": [x1, y1, x2, y2], "score": float(score)})
+        # Stabilize reading order (important for anchor→right-neighbour heuristics)
+        out_words.sort(key=lambda d: ((d["bbox"][1] + d["bbox"][3]) * 0.5, d["bbox"][0]))
 
         return w, h, out_words
 
@@ -684,9 +686,12 @@ class ArcticTiltClient:
             "client.infer_start",
             request_id=request_id,
             doc={"content_type": content_type, "size_bytes": len(doc_bytes)},
-            field_name={"field_name": field_name},
-            question={"question": question},
-            
+            field={"name": field_name},
+            params={
+                "max_candidates": max_candidates,
+                "max_neighbours": max_neighbours,
+            },
+            prompt={"provided": bool(question), "chars": len(question or "")},
         )
 
         try:
