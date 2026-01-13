@@ -67,6 +67,8 @@ MOCK_VLLM = os.getenv("MOCK_VLLM", "0") == "1"
 ENABLE_CORS = os.getenv("ENABLE_CORS", "1") == "1"
 CORS_ALLOW_ORIGINS = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")]
 
+DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "")  # optional; if set, require X-Debug-Token header for eval-mode traces
+
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 ALLOWED_CONTENT_TYPES = {
     ct.strip()
@@ -257,13 +259,32 @@ async def extract(
     field_name: Optional[str] = Form(None),
     max_candidates: Optional[int] = Form(None),
     max_neighbours: Optional[int] = Form(None),
+    sample_id: Optional[str] = Form(None),
+    gt_raw: Optional[str] = Form(None),
 ) -> Dict[str, Any]:
+    """
+    Unified inference endpoint.
+
+    - Normal inference (no trace): call without `sample_id`.
+    - Eval/debug trace mode: provide `sample_id` (non-empty). In this mode the response includes `trace`
+      with OCR words (incl. score), candidates+anchors, raw model output text, and timings.
+
+    NOTE: Eval/debug trace mode is gated by DEBUG_TOKEN.
+    """
     if tilt is None:
         if PROMETHEUS_ENABLED:
             PIPELINE_ERRORS_TOTAL.labels("api", "MODEL_CLIENT_NOT_INITIALIZED").inc()
         raise HTTPException(status_code=503, detail="Model client not initialized")
 
     request_id: str = getattr(request.state, "request_id", uuid.uuid4().hex)
+
+    eval_mode = bool(sample_id and str(sample_id).strip())
+    if eval_mode:
+        # Gate eval-mode to prevent accidental PII leakage in production.
+        if DEBUG_TOKEN:
+            token = request.headers.get("X-Debug-Token")
+            if token != DEBUG_TOKEN:
+                raise HTTPException(status_code=403, detail="Forbidden")
 
     # If question is not provided, require env default to be set
     if not question and not os.getenv("TILT_KIE_PROMPT"):
@@ -279,12 +300,15 @@ async def extract(
         "info",
         "api.extract_received",
         request_id=request_id,
+        mode="eval" if eval_mode else "inference",
         doc={
             "filename": file.filename,
             "content_type": file.content_type,
             "size_bytes": size_bytes,
         },
+        field={"name": field_name},
         question_len_chars=len(question or ""),
+        eval={"sample_id": sample_id} if eval_mode else None,
     )
 
     if file.content_type not in ALLOWED_CONTENT_TYPES:
@@ -297,7 +321,7 @@ async def extract(
 
     if not content:
         if PROMETHEUS_ENABLED:
-            PIPELINE_ERRORS_TOTAL.labels("api", "UPLOAD_EMPTY").inc()
+            PIPELINE_ERRORS_TOTAL.labels("api", "EMPTY_UPLOAD").inc()
         raise HTTPException(status_code=400, detail="Empty file")
 
     max_bytes = MAX_UPLOAD_MB * 1024 * 1024
@@ -310,18 +334,25 @@ async def extract(
         )
 
     # Inference (TILT client)
+    t0_total = time.perf_counter()
     t0 = time.perf_counter()
+    trace: Dict[str, Any] = {}
+    raw_text: str = ""
     try:
         tilt_response = tilt.infer(
-            content, 
-            content_type=file.content_type or None, question=question,
+            content,
+            content_type=file.content_type or None,
+            question=question,
             field_name=field_name,
             request_id=request_id,
             max_candidates=max_candidates,
             max_neighbours=max_neighbours,
-            )
-        fields = tilt_response['response']
-        used_question = tilt_response['used_question']
+            trace=eval_mode,
+        )
+        raw_text = tilt_response["response"]
+        if eval_mode:
+            trace = tilt_response.get("trace") or {}
+            trace["eval"] = {"sample_id": sample_id, "gt_raw": gt_raw}
     except Exception as e:  # noqa: BLE001
         if PROMETHEUS_ENABLED:
             PIPELINE_ERRORS_TOTAL.labels("tilt_client", "INFER_FAILED").inc()
@@ -329,6 +360,7 @@ async def extract(
             "error",
             "api.tilt_infer_failed",
             request_id=request_id,
+            mode="eval" if eval_mode else "inference",
             error={"type": type(e).__name__, "message": str(e)},
         )
         raise HTTPException(status_code=500, detail=f"TILT inference failed: {e}") from e
@@ -337,8 +369,10 @@ async def extract(
         if PROMETHEUS_ENABLED:
             PIPELINE_STAGE_DURATION.labels("tilt_infer").observe(dt)
 
-    # Postprocess rules (optional)
+    # Postprocess rules (final data only)
+    fields = raw_text
     rules_applied = False
+    t_rules_ms = 0.0
     if RULES_ENABLED:
         t1 = time.perf_counter()
         try:
@@ -351,25 +385,34 @@ async def extract(
                 "warning",
                 "api.postprocess_rules_failed",
                 request_id=request_id,
+                mode="eval" if eval_mode else "inference",
                 error={"type": type(e).__name__, "message": str(e)},
             )
         finally:
-            dt_rules = time.perf_counter() - t1
+            t_rules_ms = (time.perf_counter() - t1) * 1000.0
             if PROMETHEUS_ENABLED:
-                PIPELINE_STAGE_DURATION.labels("postprocess_rules").observe(dt_rules)
+                PIPELINE_STAGE_DURATION.labels("postprocess_rules").observe(t_rules_ms / 1000.0)
+
+    total_ms = (time.perf_counter() - t0_total) * 1000.0
+    if eval_mode:
+        timings = (trace.get("timings_ms") or {})
+        timings.update({"postprocess_rules": round(t_rules_ms, 2), "total": round(total_ms, 2)})
+        trace["timings_ms"] = timings
 
     obs.log_event(
         "info",
         "api.extract_done",
         request_id=request_id,
+        mode="eval" if eval_mode else "inference",
         rules_applied=rules_applied,
     )
 
-    return {
+    response: Dict[str, Any] = {
         "data": fields,
-        "question": used_question,
         "meta": {
             "request_id": request_id,
+            "status": "ok",
+            "field_name": field_name,
             "model_version": TILT_MODEL,
             "ruleset_version": os.getenv("RULESET_VERSION", "rules-0.1.0"),
             "rules_enabled": RULES_ENABLED,
@@ -377,3 +420,6 @@ async def extract(
             "source_file": file.filename,
         },
     }
+    if eval_mode:
+        response["trace"] = trace
+    return response

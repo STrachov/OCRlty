@@ -43,6 +43,7 @@ CANDIDATES_PLACEHOLDER = "{{}}"
 DEFAULT_MAX_CANDIDATES = int(os.getenv("DEFAULT_MAX_CANDIDATES", "8"))
 DEFAULT_MAX_NEIGHBOURS = int(os.getenv("DEFAULT_MAX_NEIGHBOURS", "3"))
 
+CANDIDATE_BUILDER_VERSION = os.getenv("CANDIDATE_BUILDER_VERSION", "cand-0.1")
 # Нормализованные анкоры (ты можешь расширять словарь по мере нужды)
 FIELD_ANCHOR_TIERS = {
     "total_price": [
@@ -496,6 +497,122 @@ class ArcticTiltClient:
                 return idxs, str(tier_i)
         return [], None
 
+
+    def _find_anchor_hits_for_tier(self, words: List[Dict[str, Any]], tier: List[Any]) -> List[Dict[str, Any]]:
+        """Return anchor hits with enough info for debug traces.
+
+        Each hit includes internal key '_anchor_i' used to extract candidates.
+        Public fields:
+        - anchor_key: canonical pattern key (from tier config)
+        - matched_text: actual OCR text
+        - word_index OR word_span: location in words list
+        """
+        hits: List[Dict[str, Any]] = []
+
+        # Single-token anchors
+        norm_to_keys: Dict[str, List[str]] = {}
+        for pat in tier:
+            if isinstance(pat, str):
+                norm_to_keys.setdefault(self._norm_token(pat), []).append(pat)
+
+        for i, w in enumerate(words):
+            t_raw = (w.get("text") or "").strip()
+            t_norm = self._norm_token(t_raw)
+            if not t_norm:
+                continue
+            keys = norm_to_keys.get(t_norm)
+            if not keys:
+                continue
+            for k in keys:
+                hits.append(
+                    {
+                        "anchor_key": k,
+                        "matched_text": t_raw,
+                        "word_index": i,
+                        "_anchor_i": i,
+                    }
+                )
+
+        # Phrase anchors (two adjacent tokens)
+        for pat in tier:
+            if isinstance(pat, tuple) and len(pat) == 2:
+                idxs = self._find_phrase_anchors(words, pat[0], pat[1])
+                for i in idxs:
+                    # i is the index of the 2nd token in the phrase (see _find_phrase_anchors)
+                    t1 = (words[i - 1].get("text") or "").strip() if i - 1 >= 0 else ""
+                    t2 = (words[i].get("text") or "").strip()
+                    matched = (t1 + " " + t2).strip()
+                    hits.append(
+                        {
+                            "anchor_key": f"{pat[0]} {pat[1]}",
+                            "matched_text": matched,
+                            "word_span": [i - 1, i + 1],  # end exclusive
+                            "_anchor_i": i,
+                        }
+                    )
+
+        # Deterministic order helps debugging
+        hits.sort(key=lambda h: (int(h.get("_anchor_i", 10**9)), str(h.get("anchor_key", ""))))
+        return hits
+
+    def _select_anchor_hits_by_priority(self, words: List[Dict[str, Any]], field_name: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        tiers = FIELD_ANCHOR_TIERS.get(field_name)
+        if not tiers:
+            return [], None
+
+        for tier_i, tier in enumerate(tiers, start=1):
+            hits = self._find_anchor_hits_for_tier(words, tier)
+            if hits:
+                return hits, str(tier_i)
+        return [], None
+
+    def _collect_candidates_from_pages_trace(
+        self,
+        pages_payload: List[Dict[str, Any]],
+        field_name: str,
+        max_candidates: int,
+        max_neighbours: int,
+    ) -> Tuple[List[str], Optional[str], List[Dict[str, Any]]]:
+        """Like _collect_candidates_from_pages, but also returns anchor hits for trace."""
+        out: List[str] = []
+        remaining = max_candidates
+        tier_selected: Optional[str] = None
+        anchors: List[Dict[str, Any]] = []
+
+        for page_index, p in enumerate(pages_payload):
+            ocr = (p or {}).get("ocr") or {}
+            words = ocr.get("words") or []
+            if not words:
+                continue
+
+            hits, tier = self._select_anchor_hits_by_priority(words, field_name)
+            if tier_selected is None:
+                tier_selected = tier
+
+            for h in hits:
+                if remaining <= 0:
+                    return out, tier_selected, anchors
+
+                anchor_i = int(h.get("_anchor_i"))
+                cand = self._candidate_from_anchor(words, anchor_i, max_neighbours=max_neighbours)
+                if cand is not None:
+                    out.append(cand)
+                    remaining -= 1
+
+                # keep only public fields in trace (no bbox duplication)
+                ah: Dict[str, Any] = {
+                    "anchor_key": h.get("anchor_key"),
+                    "matched_text": h.get("matched_text"),
+                    "page_index": page_index,
+                }
+                if "word_span" in h:
+                    ah["word_span"] = h["word_span"]
+                else:
+                    ah["word_index"] = h.get("word_index")
+                anchors.append(ah)
+
+        return out, tier_selected, anchors
+
     def _candidate_from_anchor(self, words: List[Dict[str, Any]], anchor_i: int, max_neighbours: int) -> Optional[str]:
         anchor_bbox = words[anchor_i].get("bbox")
         if not anchor_bbox or len(anchor_bbox) != 4:
@@ -616,58 +733,57 @@ class ArcticTiltClient:
 
         return pages_payload, total_words
 
+    def _build_pages_payload_with_trace(
+        self, images: List["Image.Image"], request_id: Optional[str]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int, float]:
+        """Build TiltRequest.pages payload and a debug trace with OCR scores.
+
+        Returns:
+        - pages_payload: list of {"ocr": {"width","height","words":[{text,bbox}]}}
+        - pages_trace: list of {"page_index","width","height","words":[{text,bbox,score}]}
+        - total_words: total OCR word count
+        - ocr_total_ms: total OCR time in milliseconds across pages
+        """
+        pages_payload: List[Dict[str, Any]] = []
+        pages_trace: List[Dict[str, Any]] = []
+        total_words = 0
+        ocr_total_ms = 0.0
+
+        for page_idx, img in enumerate(images):
+            t0 = time.time()
+            w, h, words_full = self._run_ocr(img)
+            dt_ms = (time.time() - t0) * 1000.0
+            ocr_total_ms += dt_ms
+            total_words += len(words_full)
+
+            obs.log_event(
+                "INFO",
+                "client.ocr_page_done",
+                request_id=request_id,
+                duration_ms=round(dt_ms, 2),
+                ocr={"page_idx": page_idx, "width": w, "height": h, "words": len(words_full)},
+            )
+
+            # Send to TILT: no score
+            ocr_page_payload = {
+                "width": int(w),
+                "height": int(h),
+                "words": [{"text": w_["text"], "bbox": w_["bbox"]} for w_ in words_full],
+            }
+            pages_payload.append({"ocr": ocr_page_payload})
+
+            # Keep for trace: with score
+            pages_trace.append({"page_index": page_idx, "width": int(w), "height": int(h), "words": words_full})
+
+        if not total_words:
+            raise RuntimeError("OCR produced zero words on all pages")
+
+        return pages_payload, pages_trace, total_words, ocr_total_ms
+    
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
-
-    def debug_candidates(
-        self,
-        doc_bytes: bytes,
-        content_type: Optional[str] = None,
-        question: Optional[str] = None,
-        field_name: Optional[str] = None,
-        max_candidates: Optional[int] = None,
-        max_neighbours: Optional[int] = None,
-        request_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        images = self._doc_bytes_to_images(doc_bytes, content_type)
-        if not images:
-            raise RuntimeError("No pages produced from input document")
-
-        pages_payload, total_words = self._build_pages_payload(images, request_id=request_id)
-
-        base_question = question or self.question
-        if not base_question:
-            raise ValueError("question is required (pass question=... or set TILT_KIE_PROMPT)")
-
-        used_question = base_question
-        cands: List[str] = []
-        tier_selected: Optional[str] = None
-        anchors_total = 0
-
-        if field_name and field_name in FIELD_ANCHOR_TIERS:
-            mc = int(max_candidates) if max_candidates is not None else DEFAULT_MAX_CANDIDATES
-            mn = int(max_neighbours) if max_neighbours is not None else DEFAULT_MAX_NEIGHBOURS
-            cands, tier_selected, anchors_total = self._collect_candidates_from_pages(pages_payload, field_name, mc, mn)
-            used_question = self._inject_candidates_into_question(base_question, cands)
-
-        obs.log_event(
-            "INFO",
-            "client.candidates_built",
-            request_id=request_id,
-            field={"name": field_name, "tier": tier_selected},
-            candidates={"count": len(cands), "anchors_found": anchors_total},
-        )
-
-        return {
-            "field_name": field_name,
-            "candidates": cands,
-            "tier": tier_selected,
-            "anchors_found": anchors_total,
-            "used_question": used_question,
-            "pages_payload_preview": {"num_pages": len(pages_payload), "words_total": total_words},
-        }
-
+    
     def infer(
         self,
         doc_bytes: bytes,
@@ -676,6 +792,7 @@ class ArcticTiltClient:
         field_name: Optional[str] = None,
         max_candidates: Optional[int] = None,
         max_neighbours: Optional[int] = None,
+        trace: bool = False,
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         if MOCK:
@@ -721,9 +838,12 @@ class ArcticTiltClient:
             request_id=request_id,
             doc={"pages": len(images), "content_type": content_type, "size_bytes": len(doc_bytes)},
         )
-
-        pages_payload, total_words = self._build_pages_payload(images, request_id=request_id)
-
+        if trace:
+            pages_payload, pages_trace, total_words, ocr_total_ms = self._build_pages_payload_with_trace(images, request_id=request_id)
+        else:
+            pages_payload, total_words = self._build_pages_payload(images, request_id=request_id)
+            pages_trace = []
+            ocr_total_ms = 0.0
         base_question = question or self.question
         if not base_question:
             raise ValueError("question is required (pass question=... or set TILT_KIE_PROMPT)")
@@ -733,11 +853,16 @@ class ArcticTiltClient:
         cands: List[str] = []
         tier_selected: Optional[str] = None
         anchors_total = 0
+        anchors: List[Dict[str, Any]] = []
 
         if field_name and field_name in FIELD_ANCHOR_TIERS:
             mc = int(max_candidates) if max_candidates is not None else DEFAULT_MAX_CANDIDATES
             mn = int(max_neighbours) if max_neighbours is not None else DEFAULT_MAX_NEIGHBOURS
-            cands, tier_selected, anchors_total = self._collect_candidates_from_pages(pages_payload, field_name, mc, mn)
+            if trace:
+                cands, tier_selected, anchors = self._collect_candidates_from_pages_trace(pages_payload, field_name, mc, mn)
+            else:
+                cands, tier_selected, anchors_total = self._collect_candidates_from_pages(pages_payload, field_name, mc, mn)
+                anchors = []
             used_question = self._inject_candidates_into_question(base_question, cands)
 
             obs.log_event(
@@ -763,18 +888,47 @@ class ArcticTiltClient:
             doc={"pages": len(pages_payload)},
             ocr={"words_total": total_words},
             field={"name": field_name, "mode": "candidates" if cands else "plain", "tier": tier_selected},
-            candidates={"count": len(cands)},
+            candidates={"count": len(cands), "anchors_found": (len(anchors) if trace else anchors_total)},
             prompt={"chars": len(used_question or "")},
         )
 
+        t_req = time.time()
         resp = self._post_tilt(payload, request_id=request_id)
+        tilt_req_ms = (time.time() - t_req) * 1000.0
 
         try:
             content = resp["choices"][0]["message"]["content"]
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"Unexpected tilt_api response structure: {e}; got keys={list(resp.keys())}") from e
 
-        return {"response": content, "used_question": used_question, "candidates": cands}
+        out: Dict[str, Any] = {"response": content, "used_question": used_question, "candidates": cands}
+        if trace:
+            out["trace"] = {
+                "input": {
+                    "question_base": base_question,
+                    "used_question": used_question,
+                    "field_name": field_name,
+                    "max_candidates": max_candidates,
+                    "max_neighbours": max_neighbours,
+                },
+                "ocr": {
+                    "pages": pages_trace, 
+                    "words_total": total_words
+                    },
+                "candidates": {
+                    "builder_version": CANDIDATE_BUILDER_VERSION, 
+                    "list": cands, 
+                    "anchors": anchors
+                    },
+                "tilt": {
+                    "response_text": content
+                    },
+                "timings_ms": {
+                    "ocr_total": round(ocr_total_ms, 2), 
+                    "tilt_request": round(tilt_req_ms, 2)
+                    },
+            }
+        return out
 
     def close(self) -> None:
         try:
