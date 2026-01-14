@@ -901,7 +901,11 @@ class ArcticTiltClient:
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"Unexpected tilt_api response structure: {e}; got keys={list(resp.keys())}") from e
 
-        out: Dict[str, Any] = {"response": content, "used_question": used_question, "candidates": cands}
+        out: Dict[str, Any] = {
+            "response": content, 
+            "used_question": used_question, 
+            "candidates": cands
+            }
         if trace:
             out["trace"] = {
                 "input": {

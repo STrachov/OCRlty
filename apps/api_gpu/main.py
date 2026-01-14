@@ -334,7 +334,6 @@ async def extract(
         )
 
     # Inference (TILT client)
-    t0_total = time.perf_counter()
     t0 = time.perf_counter()
     trace: Dict[str, Any] = {}
     raw_text: str = ""
@@ -393,7 +392,7 @@ async def extract(
             if PROMETHEUS_ENABLED:
                 PIPELINE_STAGE_DURATION.labels("postprocess_rules").observe(t_rules_ms / 1000.0)
 
-    total_ms = (time.perf_counter() - t0_total) * 1000.0
+    total_ms = (time.perf_counter() - t0) * 1000.0
     if eval_mode:
         timings = (trace.get("timings_ms") or {})
         timings.update({"postprocess_rules": round(t_rules_ms, 2), "total": round(total_ms, 2)})
