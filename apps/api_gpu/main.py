@@ -4,8 +4,9 @@ import json
 import os
 import time
 import uuid
+import secrets
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set, List
 from contextlib import asynccontextmanager
 
 import httpx
@@ -67,9 +68,77 @@ MOCK_VLLM = os.getenv("MOCK_VLLM", "0") == "1"
 ENABLE_CORS = os.getenv("ENABLE_CORS", "1") == "1"
 CORS_ALLOW_ORIGINS = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")]
 
-DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "")  # optional; if set, require X-Debug-Token header for eval-mode traces
-
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
+
+ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "0") == "1"
+DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "")
+AUTH_ENABLED = os.getenv("AUTH_ENABLED", "1") == "1"
+API_KEYS_JSON = os.getenv("API_KEYS_JSON", "").strip()
+
+def _load_api_keys() -> Dict[str, Dict[str, Any]]:
+    """Load API keys from env.
+
+    Expected format (JSON object):
+      {
+        "<api_key>": {"id": "infer-1", "scopes": ["infer"]},
+        "<api_key>": {"id": "debug-1", "scopes": ["infer", "debug"]}
+      }
+    """
+    if not API_KEYS_JSON:
+        return {}
+    try:
+        data = json.loads(API_KEYS_JSON)
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger("api").error("Failed to parse API_KEYS_JSON: %s", e)
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for k, v in (data or {}).items():
+        if not isinstance(k, str) or not k:
+            continue
+        scopes = v.get("scopes", []) if isinstance(v, dict) else []
+        if not isinstance(scopes, list):
+            scopes = []
+        out[k] = {
+            "id": (v.get("id") if isinstance(v, dict) else None) or "unknown",
+            "scopes": set(str(s) for s in scopes),
+        }
+    return out
+
+_API_KEYS: Dict[str, Dict[str, Any]] = _load_api_keys()
+_API_KEY_LIST: List[str] = list(_API_KEYS.keys())
+
+def _require_api_key(request: Request, required_scope: str) -> Dict[str, Any]:
+    """Authenticate and authorize request by X-API-Key + scope.
+
+    - Always expects header: X-API-Key
+    - required_scope: "infer" or "debug"
+    """
+    if AUTH_ENABLED:
+        if not _API_KEY_LIST:
+            raise HTTPException(status_code=503, detail="Auth not configured (API_KEYS_JSON is empty)")
+        api_key = request.headers.get("X-API-Key")
+        if not api_key:
+            raise HTTPException(status_code=401, detail="Missing X-API-Key")
+
+        rec: Optional[Dict[str, Any]] = None
+        # Constant-time match against configured keys (expected small N).
+        for k in _API_KEY_LIST:
+            if secrets.compare_digest(api_key, k):
+                rec = _API_KEYS[k]
+                break
+        if rec is None:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        scopes: Set[str] = rec.get("scopes", set())
+        if required_scope not in scopes:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        return rec
+
+    # AUTH disabled (dev only)
+    return {"id": "auth_disabled", "scopes": set(["infer", "debug"])}
+  # optional; if set, require X-Debug-Token header for eval-mode traces
 ALLOWED_CONTENT_TYPES = {
     ct.strip()
     for ct in os.getenv(
@@ -269,7 +338,7 @@ async def extract(
     - Eval/debug trace mode: provide `sample_id` (non-empty). In this mode the response includes `trace`
       with OCR words (incl. score), candidates+anchors, raw model output text, and timings.
 
-    NOTE: Eval/debug trace mode is gated by DEBUG_TOKEN.
+    NOTE: Eval/debug trace mode is gated by ENABLE_DEBUG_ENDPOINTS and optionally DEBUG_TOKEN.
     """
     if tilt is None:
         if PROMETHEUS_ENABLED:
@@ -279,11 +348,16 @@ async def extract(
     request_id: str = getattr(request.state, "request_id", uuid.uuid4().hex)
 
     eval_mode = bool(sample_id and str(sample_id).strip())
+    required_scope = "debug" if eval_mode else "infer"
+    auth = _require_api_key(request, required_scope=required_scope)
+    key_id = auth.get("id", "unknown")
     if eval_mode:
         # Gate eval-mode to prevent accidental PII leakage in production.
+        if not ENABLE_DEBUG_ENDPOINTS:
+            raise HTTPException(status_code=404, detail="Not found")
         if DEBUG_TOKEN:
-            token = request.headers.get("X-Debug-Token")
-            if token != DEBUG_TOKEN:
+            token = request.headers.get("X-Debug-Token") or ""
+            if not secrets.compare_digest(token, DEBUG_TOKEN):
                 raise HTTPException(status_code=403, detail="Forbidden")
 
     # If question is not provided, require env default to be set
@@ -301,13 +375,14 @@ async def extract(
         "api.extract_received",
         request_id=request_id,
         mode="eval" if eval_mode else "inference",
+        auth={"key_id": key_id},
         doc={
             "filename": file.filename,
             "content_type": file.content_type,
             "size_bytes": size_bytes,
         },
         field={"name": field_name},
-        question_len_chars=len(question or ""),
+        question_len_chars=len((question or os.getenv("TILT_KIE_PROMPT") or "")),
         eval={"sample_id": sample_id} if eval_mode else None,
     )
 
@@ -360,6 +435,7 @@ async def extract(
             "api.tilt_infer_failed",
             request_id=request_id,
             mode="eval" if eval_mode else "inference",
+            auth={"key_id": key_id},
             error={"type": type(e).__name__, "message": str(e)},
         )
         raise HTTPException(status_code=500, detail=f"TILT inference failed: {e}") from e
@@ -385,6 +461,7 @@ async def extract(
                 "api.postprocess_rules_failed",
                 request_id=request_id,
                 mode="eval" if eval_mode else "inference",
+                auth={"key_id": key_id},
                 error={"type": type(e).__name__, "message": str(e)},
             )
         finally:
@@ -410,8 +487,8 @@ async def extract(
         "data": fields,
         "meta": {
             "request_id": request_id,
+            "client_key_id": key_id,
             "status": "ok",
-            "field_name": field_name,
             "model_version": TILT_MODEL,
             "ruleset_version": os.getenv("RULESET_VERSION", "rules-0.1.0"),
             "rules_enabled": RULES_ENABLED,
