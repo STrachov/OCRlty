@@ -164,6 +164,7 @@ def _build_samples_from_cord_gt(
         if not img:
             continue
         img_path = _resolve_image_path(str(img), dataset_root=dataset_root)
+        print(f"img_path: {img_path}")
         gt = _gt_to_string(rec.get(field_name))
         out.append(Sample(sample_id=sid, image_path=img_path, gt_raw=gt))
         if limit is not None and len(out) >= limit:
