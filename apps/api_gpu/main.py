@@ -71,7 +71,7 @@ CORS_ALLOW_ORIGINS = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").sp
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 
 ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "0") == "1"
-DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "")
+
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "1") == "1"
 API_KEYS_JSON = os.getenv("API_KEYS_JSON", "").strip()
 
@@ -338,7 +338,7 @@ async def extract(
     - Eval/debug trace mode: provide `sample_id` (non-empty). In this mode the response includes `trace`
       with OCR words (incl. score), candidates+anchors, raw model output text, and timings.
 
-    NOTE: Eval/debug trace mode is gated by ENABLE_DEBUG_ENDPOINTS and optionally DEBUG_TOKEN.
+    NOTE: Eval/debug trace mode is gated by ENABLE_DEBUG_ENDPOINTS.
     """
     if tilt is None:
         if PROMETHEUS_ENABLED:
@@ -355,10 +355,6 @@ async def extract(
         # Gate eval-mode to prevent accidental PII leakage in production.
         if not ENABLE_DEBUG_ENDPOINTS:
             raise HTTPException(status_code=404, detail="Not found")
-        if DEBUG_TOKEN:
-            token = request.headers.get("X-Debug-Token") or ""
-            if not secrets.compare_digest(token, DEBUG_TOKEN):
-                raise HTTPException(status_code=403, detail="Forbidden")
 
     # If question is not provided, require env default to be set
     if not question and not os.getenv("TILT_KIE_PROMPT"):
