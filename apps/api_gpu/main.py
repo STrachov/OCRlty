@@ -330,6 +330,7 @@ async def extract(
     field_name: Optional[str] = Form(None),
     max_candidates: Optional[int] = Form(None),
     max_neighbours: Optional[int] = Form(None),
+    candidates_mode: str = Form("off"),
     sample_id: Optional[str] = Form(None),
     gt_raw: Optional[str] = Form(None),
 ) -> Dict[str, Any]:
@@ -380,6 +381,7 @@ async def extract(
             "size_bytes": size_bytes,
         },
         field={"name": field_name},
+        candidates_mode=candidates_mode,
         question_len_chars=len((question or os.getenv("TILT_KIE_PROMPT") or "")),
         eval={"sample_id": sample_id} if eval_mode else None,
     )
@@ -419,6 +421,7 @@ async def extract(
             request_id=request_id,
             max_candidates=max_candidates,
             max_neighbours=max_neighbours,
+            candidates_mode=candidates_mode,
             trace=eval_mode,
         )
         raw_text = tilt_response["response"]

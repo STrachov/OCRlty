@@ -792,6 +792,7 @@ class ArcticTiltClient:
         field_name: Optional[str] = None,
         max_candidates: Optional[int] = None,
         max_neighbours: Optional[int] = None,
+        candidates_mode: str = "off",
         trace: bool = False,
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -807,6 +808,7 @@ class ArcticTiltClient:
             params={
                 "max_candidates": max_candidates,
                 "max_neighbours": max_neighbours,
+                "candidates_mode": candidates_mode,
             },
             prompt={"provided": bool(question), "chars": len(question or "")},
         )
@@ -850,12 +852,16 @@ class ArcticTiltClient:
 
         used_question = base_question
 
+        cand_mode = (candidates_mode or "off").strip().lower()
+        if cand_mode not in ("off", "on"):
+            cand_mode = "off"
+
         cands: List[str] = []
         tier_selected: Optional[str] = None
         anchors_total = 0
         anchors: List[Dict[str, Any]] = []
 
-        if field_name and field_name in FIELD_ANCHOR_TIERS:
+        if cand_mode == "on" and field_name and field_name in FIELD_ANCHOR_TIERS:
             mc = int(max_candidates) if max_candidates is not None else DEFAULT_MAX_CANDIDATES
             mn = int(max_neighbours) if max_neighbours is not None else DEFAULT_MAX_NEIGHBOURS
             if trace:
@@ -914,6 +920,7 @@ class ArcticTiltClient:
                     "field_name": field_name,
                     "max_candidates": max_candidates,
                     "max_neighbours": max_neighbours,
+                    "candidates_mode": cand_mode,
                 },
                 "ocr": {
                     "pages": pages_trace, 
