@@ -74,7 +74,8 @@ ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "1") == "1"
 
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "1") == "1"
 API_KEYS_JSON_DEFAULT = '{"k_infer_123":{"id":"infer-1","scopes":["infer"]},"k_debug_456":{"id":"debug-1","scopes":["infer","debug"]}}'
-API_KEYS_JSON = os.getenv("API_KEYS_JSON", API_KEYS_JSON_DEFAULT).strip()
+#API_KEYS_JSON = os.getenv("API_KEYS_JSON", API_KEYS_JSON_DEFAULT).strip()
+API_KEYS_JSON = API_KEYS_JSON_DEFAULT
 
 def _load_api_keys() -> Dict[str, Dict[str, Any]]:
     """Load API keys from env.
