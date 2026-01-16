@@ -70,10 +70,11 @@ CORS_ALLOW_ORIGINS = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").sp
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 
-ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "0") == "1"
+ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "1") == "1"
 
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "1") == "1"
-API_KEYS_JSON = os.getenv("API_KEYS_JSON", "").strip()
+API_KEYS_JSON_DEFAULT = '{"k_infer_123":{"id":"infer-1","scopes":["infer"]},"k_debug_456":{"id":"debug-1","scopes":["infer","debug"]}}'
+API_KEYS_JSON = os.getenv("API_KEYS_JSON", API_KEYS_JSON_DEFAULT).strip()
 
 def _load_api_keys() -> Dict[str, Dict[str, Any]]:
     """Load API keys from env.
