@@ -125,6 +125,7 @@ ___________________
 
 curl -X POST "http://127.0.0.1:8000/v1/extract" \
 -H "Accept: application/json" \
+-H "X-API-Key: k_debug_456" \
 -F "file=@/workspace/src/data/cord_subset/images/cord_0050.jpg;type=image/png" \
 -F "field_name=total_price" \
 -F "max_neighbours=3" \
@@ -132,3 +133,20 @@ curl -X POST "http://127.0.0.1:8000/v1/extract" \
 Return EXACTLY ONE of these strings (copy-paste, no edits):
 {{}}
 Output only the chosen string.'
+
+
+
+curl -X POST "http://127.0.0.1:8000/v1/extract" \
+-H "Accept: application/json" \
+-H "X-API-Key: k_debug_456" \
+-F "file=@/workspace/src/data/cord_subset/images/cord_0050.jpg;type=image/png" \
+-F "field_name=na" \
+-F 'question=You see the OCR words and positions from a sales receipt. 
+Find the line with the total amount (may be labeled with word grand or using abbreviations like ttl) and return the amount written right to it.'
+
+
+python scripts/eval_runner.py \
+  --api-key "k_debug_456" \
+  --field-name na \
+  --prompt "You see the OCR words and positions from a sales receipt. 
+Find the line with the total amount (may be labeled with word grand or using abbreviations like ttl) and return the amount written right to it."

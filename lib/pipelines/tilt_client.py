@@ -887,8 +887,8 @@ class ArcticTiltClient:
             request_id=request_id,
             doc={"pages": len(pages_payload)},
             ocr={"words_total": total_words},
-            field={"name": field_name, "mode": "candidates" if cands else "plain", "tier": tier_selected},
-            candidates={"count": len(cands), "anchors_found": (len(anchors) if trace else anchors_total)},
+            field={"name": field_name},
+            candidates={"count": len(cands), "anchors_found": (len(anchors) if trace else anchors_total), "tier": tier_selected},
             prompt={"chars": len(used_question or "")},
         )
 
